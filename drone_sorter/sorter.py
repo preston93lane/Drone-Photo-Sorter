@@ -32,6 +32,14 @@ DEFAULT_CONFIG = {
         {"name": "Tower Climb", "pitch": -25},
         {"name": "Overall", "pitch": -90},
     ],
+    # Shot-order rules: photos taken *between* the last photo at one angle and
+    # the first photo at the next angle go to "category", whatever their angle.
+    "sequence_rules": [
+        {"category": "Compound Flight", "after_pitch": -45, "before_pitch": -20},
+        {"category": "Overall", "after_pitch": -25, "before_pitch": -90},
+    ],
+    # Safety limit: a gap with more photos than this is left alone.
+    "max_photos_between": 15,
 }
 
 
@@ -53,6 +61,19 @@ class FileResult:
     dest: Path | None
     action: str  # copied | moved | skipped | planned | error
     error: str = ""
+    rule: str = ""  # set when a shot-order rule chose the category
+
+
+@dataclass(frozen=True)
+class SequenceRule:
+    category: str
+    after_pitch: float
+    before_pitch: float
+    tolerance: float = 0.5
+    max_between: int = 15
+
+    def label(self) -> str:
+        return f"between {self.after_pitch:g}° and {self.before_pitch:g}°"
 
 
 # ---------------------------------------------------------------- config ---
@@ -94,6 +115,52 @@ def categories_from_config(cfg: dict, tolerance: float | None = None) -> list[Ca
             lo, hi = center - tol, center + tol
         cats.append(Category(name, min(lo, hi), max(lo, hi)))
     return cats
+
+
+def rules_from_config(cfg: dict, tolerance: float | None = None) -> list[SequenceRule]:
+    """Shot-order rules. A config without the key (e.g. one made by an older
+    version) gets the default rules; an empty list turns them off."""
+    tol = float(cfg.get("tolerance", 0.5) if tolerance is None else tolerance)
+    raw = cfg.get("sequence_rules", DEFAULT_CONFIG["sequence_rules"])
+    limit = int(cfg.get("max_photos_between", DEFAULT_CONFIG["max_photos_between"]))
+    return [
+        SequenceRule(str(r["category"]).strip(), float(r["after_pitch"]), float(r["before_pitch"]),
+                     float(r.get("tolerance", tol)), int(r.get("max_photos_between", limit)))
+        for r in raw
+    ]
+
+
+def apply_sequence_rules(
+    pitches: list[float | None], categories: list[str], rules: Iterable[SequenceRule]
+) -> tuple[list[str], list[str]]:
+    """Re-label photos that sit between two angle sets, using shot order.
+
+    ``pitches``/``categories`` are for ONE folder, in shooting order. For each
+    rule, wherever a run of ``before_pitch`` photos starts, look back to the
+    nearest ``after_pitch`` photo; every photo in between gets the rule's
+    category. Nothing happens if there's no such photo within the limit, or if
+    another ``before_pitch`` photo is in the way. Returns (categories, reasons).
+    """
+    cats = list(categories)
+    reasons = [""] * len(cats)
+
+    for rule in rules:
+        def near(p, target):
+            return p is not None and abs(p - target) <= rule.tolerance
+
+        for j, p in enumerate(pitches):
+            if not near(p, rule.before_pitch) or (j > 0 and near(pitches[j - 1], rule.before_pitch)):
+                continue  # only at the first photo of each "before" run
+            i = j - 1
+            while i >= 0 and not near(pitches[i], rule.after_pitch) and not near(pitches[i], rule.before_pitch):
+                i -= 1
+            gap = j - 1 - i
+            if i < 0 or not near(pitches[i], rule.after_pitch) or gap == 0 or gap > rule.max_between:
+                continue
+            for k in range(i + 1, j):
+                cats[k] = rule.category
+                reasons[k] = rule.label()
+    return cats, reasons
 
 
 def load_config(path: Path | None = None) -> dict:
@@ -341,6 +408,7 @@ def sort_photos(
     cancel: threading.Event | None = None,
     workers: int = 8,
     write_log: bool = True,
+    rules: list[SequenceRule] | None = None,
 ) -> list[FileResult]:
     """Sort every photo under ``sources``. Pitch reading runs in parallel;
     file placement is sequential so name-collision handling stays safe.
@@ -366,23 +434,45 @@ def sort_photos(
         except OSError as e:
             return None, str(e)
 
+    # Pass 1: read every pitch (fast, parallel).
+    readings: list[tuple[float | None, str]] = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for r in pool.map(read, jobs):
+            if cancel is not None and cancel.is_set():
+                pool.shutdown(wait=False, cancel_futures=True)
+                return results
+            readings.append(r)
+
+    # Pass 2: decide categories, folder by folder, in shooting (file-name) order.
+    cats = [assign_category(p, categories) for p, _ in readings]
+    reasons = [""] * total
+    if rules:
+        by_folder: dict[Path, list[int]] = {}
+        for idx, (_, img) in enumerate(jobs):
+            by_folder.setdefault(img.parent, []).append(idx)
+        for idxs in by_folder.values():
+            idxs.sort(key=lambda k: jobs[k][1].name.lower())
+            new_cats, new_reasons = apply_sequence_rules(
+                [readings[k][0] for k in idxs], [cats[k] for k in idxs], rules)
+            for k, c, why in zip(idxs, new_cats, new_reasons):
+                cats[k], reasons[k] = c, why
+
+    # Pass 3: place files (sequential, so name-collision handling stays safe).
     try:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            for i, ((root, img), (pitch, read_err)) in enumerate(zip(jobs, pool.map(read, jobs)), 1):
-                if cancel is not None and cancel.is_set():
-                    pool.shutdown(wait=False, cancel_futures=True)
-                    break
-                category = assign_category(pitch, categories)
-                try:
-                    dest, action = place_file(img, category, move, dry_run)
-                    res = FileResult(img, pitch, category, dest, action, read_err)
-                except OSError as e:
-                    res = FileResult(img, pitch, category, None, "error", str(e))
-                if log is not None and res.action in ("moved", "copied"):
-                    log.add(root, res)
-                results.append(res)
-                if on_progress:
-                    on_progress(i, total, res)
+        for i, ((root, img), (pitch, read_err), category, why) in enumerate(
+                zip(jobs, readings, cats, reasons), 1):
+            if cancel is not None and cancel.is_set():
+                break
+            try:
+                dest, action = place_file(img, category, move, dry_run)
+                res = FileResult(img, pitch, category, dest, action, read_err, why)
+            except OSError as e:
+                res = FileResult(img, pitch, category, None, "error", str(e), why)
+            if log is not None and res.action in ("moved", "copied"):
+                log.add(root, res)
+            results.append(res)
+            if on_progress:
+                on_progress(i, total, res)
     finally:
         if log is not None:
             log.close()
@@ -401,8 +491,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--config", type=Path, help="categories.json to use")
     args = ap.parse_args(argv)
 
-    cats = categories_from_config(load_config(args.config))
-    results = sort_photos(args.folders, cats, move=args.move, dry_run=args.dry_run)
+    cfg = load_config(args.config)
+    results = sort_photos(args.folders, categories_from_config(cfg), move=args.move,
+                          dry_run=args.dry_run, rules=rules_from_config(cfg))
     for r in results:
         pitch = f"{r.pitch:.1f}" if r.pitch is not None else "N/A"
         print(f"{r.action:8} {pitch:>7}  {r.source} -> {r.category}/")

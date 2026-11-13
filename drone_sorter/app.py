@@ -17,6 +17,7 @@ from . import __version__
 from .sorter import (
     UNSORTED,
     categories_from_config,
+    rules_from_config,
     ensure_config_file,
     find_images,
     load_config,
@@ -44,9 +45,12 @@ POLL_MS = 80
 MAX_EVENTS_PER_POLL = 500
 
 MODE_HELP = {
-    "copy": "Originals stay where they are. Sorted copies go into category folders.",
+    "copy": "Originals stay where they are. Sorted copies go into category folders. "
+            "Shot order also files in-between photos, e.g. the angle change from -45° to -20° "
+            "goes to Compound Flight.",
     "move": "Photos are moved into category folders. Nothing is ever deleted or "
-            "overwritten, and a sort log is saved so you can undo it.",
+            "overwritten, and a sort log is saved so you can undo it. Shot order also files "
+            "in-between photos.",
 }
 
 
@@ -73,6 +77,8 @@ class DroneSorterApp:
 
         self.mode = tk.StringVar(value="copy")
         self.preview = tk.BooleanVar(value=False)
+        self.use_order = tk.BooleanVar(value=True)
+        self.rules = []
         self.tolerance = tk.StringVar()
 
         try:
@@ -180,11 +186,16 @@ class DroneSorterApp:
         self.sw_preview = ttk.Checkbutton(row, text="Preview only", variable=self.preview,
                                           style="Switch.TCheckbutton")
         self.sw_preview.pack(side=tk.LEFT, padx=(24, 0))
-        self.btn_config = ttk.Button(row, text="Edit angles…", command=self._open_config)
+        self.sw_order = ttk.Checkbutton(row, text="Use shot order", variable=self.use_order,
+                                        style="Switch.TCheckbutton")
+        self.sw_order.pack(side=tk.LEFT, padx=(18, 0))
+        row2 = ttk.Frame(card2)
+        row2.pack(fill=tk.X, pady=(12, 0))
+        self.btn_config = ttk.Button(row2, text="Edit angles & rules…", command=self._open_config)
         self.btn_config.pack(side=tk.RIGHT)
-        tol = ttk.Frame(row)
-        tol.pack(side=tk.RIGHT, padx=(0, 16))
-        ttk.Label(tol, text="Tolerance ±").pack(side=tk.LEFT)
+        tol = ttk.Frame(row2)
+        tol.pack(side=tk.LEFT)
+        ttk.Label(tol, text="Angle tolerance ±").pack(side=tk.LEFT)
         self.spin_tol = ttk.Spinbox(tol, from_=0.1, to=10, increment=0.1, width=5,
                                     textvariable=self.tolerance)
         self.spin_tol.pack(side=tk.LEFT, padx=(6, 4))
@@ -359,7 +370,7 @@ class DroneSorterApp:
 
     def _set_running(self, running: bool):
         for w in (self.btn_start, self.btn_browse, self.btn_clear, self.btn_config, self.btn_undo,
-                  self.rb_copy, self.rb_move, self.sw_preview, self.spin_tol):
+                  self.rb_copy, self.rb_move, self.sw_preview, self.sw_order, self.spin_tol):
             w.state(["disabled"] if running else ["!disabled"])
         self.btn_cancel.state(["!disabled"] if running else ["disabled"])
         if not running:
@@ -369,7 +380,9 @@ class DroneSorterApp:
         try:
             text = self.tolerance.get().strip()
             tol = float(text) if text else None
-            cats = categories_from_config(load_config(self.config_file), tol)
+            cfg = load_config(self.config_file)
+            cats = categories_from_config(cfg, tol)
+            self.rules = rules_from_config(cfg, tol) if self.use_order.get() else []
         except (ValueError, KeyError, TypeError) as e:
             if not silent:
                 messagebox.showerror("Settings", f"The tolerance or categories.json isn't valid:\n\n{e}")
@@ -407,7 +420,7 @@ class DroneSorterApp:
         def work():
             try:
                 results = sort_photos(
-                    self.source_dirs, categories, move=move, dry_run=dry,
+                    self.source_dirs, categories, move=move, dry_run=dry, rules=self.rules,
                     on_progress=lambda i, n, r: self.events.put(("progress", i, n, r)),
                     cancel=self.cancel_event,
                 )
@@ -506,7 +519,8 @@ class DroneSorterApp:
             return (f"error     {name}: {r.error}", "err")
         renamed = f"  (saved as {r.dest.name})" if r.dest and r.dest.name != r.source.name else ""
         tag = "warn" if r.category == UNSORTED or r.action == "skipped" else None
-        return (f"{r.action:9} {pitch}  {name}  →  {r.category}{renamed}", tag)
+        why = f"  (shot order: {r.rule})" if r.rule else ""
+        return (f"{r.action:9} {pitch}  {name}  →  {r.category}{renamed}{why}", tag)
 
     def _update_progress(self, i: int, n: int):
         self.progress["value"] = (i / n) * 100 if n else 100

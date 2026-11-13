@@ -24,7 +24,8 @@ Every push also builds the exe as a downloadable artifact on the **Actions** tab
 | **Copy / Move** | Copy keeps the originals (default). Move puts them into the category folders. |
 | **Preview only** | Shows what would happen and touches nothing. |
 | **Tolerance ±°** | How close the pitch must be to a category's angle (default 0.5°). |
-| **Edit angles…** | Opens `categories.json` (created next to the exe on first run). |
+| **Use shot order** | Files in-between photos by shot order (see below). |
+| **Edit angles & rules…** | Opens `categories.json` (created next to the exe on first run). |
 
 Photos are sorted into subfolders **inside the folder they came from**, e.g.
 `Flight1/Tower Flight/DJI_0001.JPG`. Photos with no pitch, or a pitch that doesn't
@@ -53,6 +54,22 @@ Yes. Move is built so that a photo can't be lost:
 These rules are covered by automated tests (`tests/test_move_safety.py`) that simulate
 name clashes, a disk-full error mid-copy, and drives without link support.
 
+## Shot-order rules
+
+Some shots don't have a fixed angle. Because your shot list is always in the same order,
+the app uses the order the photos were taken in (DJI file numbers) to file those too:
+
+| Photos taken between… | …and… | go to |
+|---|---|---|
+| the last **−45°** photo | the first **−20°** photo | **Compound Flight** (the angle raise) |
+| the last **−25°** photo | the first **−90°** photo | **Overall** (the safety cable anchor shot) |
+
+This applies whatever angle those in-between photos have, even if it happens to match
+another category. Each folder is handled on its own, so a set is never linked to photos
+in a different folder. As a safety limit, a gap of more than 15 photos is left alone.
+In the Activity tab, these photos are marked "shot order". Turn the **Use shot order**
+switch off to sort by angle only.
+
 ## Editing categories
 
 `categories.json`:
@@ -64,7 +81,12 @@ name clashes, a disk-full error mid-copy, and drives without link support.
     { "name": "Tower Flight", "pitch": -40 },
     { "name": "Uplook", "pitch": 20 },
     { "name": "Wide band example", "min": -30, "max": -10 }
-  ]
+  ],
+  "sequence_rules": [
+    { "category": "Compound Flight", "after_pitch": -45, "before_pitch": -20 },
+    { "category": "Overall", "after_pitch": -25, "before_pitch": -90 }
+  ],
+  "max_photos_between": 15
 }
 ```
 
