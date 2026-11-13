@@ -1,0 +1,2 @@
+# Optional: enables drag & drop of folders onto the window.
+tkinterdnd2>=0.4
