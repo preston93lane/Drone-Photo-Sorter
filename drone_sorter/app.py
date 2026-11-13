@@ -1,4 +1,4 @@
-"""Tkinter desktop UI for the drone photo sorter."""
+"""Desktop UI for the drone photo sorter (Windows 11 "Sun Valley" look)."""
 
 from __future__ import annotations
 
@@ -11,15 +11,17 @@ import time
 import tkinter as tk
 from collections import Counter
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, ttk
 
 from . import __version__
 from .sorter import (
     UNSORTED,
     categories_from_config,
     ensure_config_file,
+    find_images,
     load_config,
     sort_photos,
+    undo_sort_log,
 )
 
 try:
@@ -28,38 +30,49 @@ try:
 except ImportError:
     HAS_DND = False
 
-# Palette (same as v5)
-BG_DARK = "#1E1E2E"
-BG_CARD = "#2A2A3C"
-BG_TEXT = "#181825"
-FG_LIGHT = "#CDD6F4"
-FG_MUTED = "#A6ADC8"
-ACCENT_BLUE = "#89B4FA"
-ACCENT_GREEN = "#A6E3A1"
-ACCENT_RED = "#F38BA8"
-ACCENT_YELLOW = "#F9E2AF"
+try:
+    import sv_ttk
+except ImportError:
+    sv_ttk = None
 
-FONT = "Segoe UI"
-POLL_MS = 100
-MAX_LOG_LINES_PER_POLL = 400
+try:
+    import darkdetect
+except ImportError:
+    darkdetect = None
+
+POLL_MS = 80
+MAX_EVENTS_PER_POLL = 500
+
+MODE_HELP = {
+    "copy": "Originals stay where they are. Sorted copies go into category folders.",
+    "move": "Photos are moved into category folders. Nothing is ever deleted or "
+            "overwritten, and a sort log is saved so you can undo it.",
+}
+
+
+def _font(size: int, weight: str = "normal") -> tuple:
+    family = "Segoe UI Variable Display" if os.name == "nt" else "Segoe UI"
+    return (family, size, weight)
 
 
 class DroneSorterApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title(f"Drone Pitch Sorter v{__version__}")
-        root.geometry("760x620")
-        root.minsize(620, 480)
-        root.configure(bg=BG_DARK, padx=20, pady=20)
+        root.title("Drone Pitch Sorter")
+        root.geometry("860x820")
+        root.minsize(720, 640)
 
         self.source_dirs: list[Path] = []
         self.worker: threading.Thread | None = None
         self.cancel_event = threading.Event()
         self.events: queue.Queue = queue.Queue()
         self.start_time = 0.0
+        self.photo_count: int | None = None
+        self._count_token = 0
+        self._count_shows_status = True
 
         self.mode = tk.StringVar(value="copy")
-        self.dry_run = tk.BooleanVar(value=False)
+        self.preview = tk.BooleanVar(value=False)
         self.tolerance = tk.StringVar()
 
         try:
@@ -68,102 +81,185 @@ class DroneSorterApp:
             self.config_file = None
         self.tolerance.set(str(load_config(self.config_file).get("tolerance", 0.5)))
 
-        self._setup_styles()
-        self._setup_ui()
-        self._log("Ready. Pitch is read directly from each photo, no ExifTool needed.")
-        if self.config_file:
-            self._log(f"Categories file: {self.config_file}")
+        self._apply_theme(darkdetect.theme().lower() if darkdetect and darkdetect.theme() else "light")
+        self._build()
+        self.mode.trace_add("write", lambda *_: self._refresh_mode())
+        self.preview.trace_add("write", lambda *_: self._refresh_start_button())
+        self._refresh_mode()
+        self._refresh_start_button()
+        self._log("Ready. Gimbal pitch is read straight from each photo.")
         self.root.after(POLL_MS, self._poll_events)
 
-    # ------------------------------------------------------------ layout ---
-    def _setup_styles(self):
+    # ------------------------------------------------------------- theme ---
+    def _apply_theme(self, name: str):
+        self.theme = name
+        if sv_ttk:
+            sv_ttk.set_theme(name)
         style = ttk.Style()
-        style.theme_use("clam")
-        style.configure(
-            "Horizontal.TProgressbar",
-            troughcolor=BG_CARD, background=ACCENT_BLUE,
-            thickness=8, borderwidth=0,
-        )
+        self.c_bg = style.lookup("TFrame", "background") or "#fafafa"
+        self.c_fg = style.lookup("TLabel", "foreground") or "#1c1c1c"
+        dark = name == "dark"
+        self.c_muted = "#9a9a9a" if dark else "#6b6b6b"
+        self.c_accent = "#57c8ff" if dark else "#005fb8"
+        self.c_warn = "#fce100" if dark else "#9d5d00"
+        self.c_err = "#ff99a4" if dark else "#c42b1c"
+        self.c_ok = "#6ccb5f" if dark else "#0f7b0f"
+        self.c_field = "#2b2b2b" if dark else "#ffffff"
+        style.configure("Title.TLabel", font=_font(22, "bold"))
+        style.configure("Sub.TLabel", font=_font(10), foreground=self.c_muted)
+        style.configure("Step.TLabel", font=_font(12, "bold"))
+        style.configure("Muted.TLabel", font=_font(9), foreground=self.c_muted)
+        style.configure("Drop.TLabel", font=_font(11), foreground=self.c_muted)
+        style.configure("Status.TLabel", font=_font(9), foreground=self.c_muted)
+        style.configure("Treeview", rowheight=30)
+        if hasattr(self, "log_text"):
+            self._style_text()
 
-    def _button(self, parent, text, command, bg=BG_CARD, fg=FG_LIGHT, **kw):
-        return tk.Button(
-            parent, text=text, command=command, font=(FONT, 9, "bold"),
-            bg=bg, fg=fg, activebackground=ACCENT_BLUE, activeforeground=BG_DARK,
-            disabledforeground="#585B70", bd=0, padx=15, pady=8, cursor="hand2", **kw,
-        )
+    def _style_text(self):
+        self.log_text.configure(bg=self.c_field, fg=self.c_fg, insertbackground=self.c_fg,
+                                selectbackground=self.c_accent)
+        for tag, color in (("ok", self.c_ok), ("warn", self.c_warn),
+                           ("err", self.c_err), ("muted", self.c_muted)):
+            self.log_text.tag_config(tag, foreground=color)
+        self.results.tag_configure("unsorted", foreground=self.c_warn)
+        self.drop_icon.configure(foreground=self.c_accent)
 
-    def _setup_ui(self):
-        tk.Label(
-            self.root, text="Gimbal Pitch Photo Sorter",
-            font=(FONT, 14, "bold"), bg=BG_DARK, fg=FG_LIGHT,
-        ).pack(anchor="w", pady=(0, 10))
+    def _toggle_theme(self):
+        self._apply_theme("light" if self.theme == "dark" else "dark")
 
-        # Drop zone
-        drop = tk.Frame(self.root, bg=BG_CARD, highlightbackground=ACCENT_BLUE, highlightthickness=1)
-        drop.pack(fill=tk.X, pady=(0, 12), ipady=18)
-        text = ("Drag & drop flight folders here\n(or click 'Browse Folder')"
-                if HAS_DND else "Click 'Browse Folder' to select a flight folder.")
-        tk.Label(drop, text=text, bg=BG_CARD, fg=FG_LIGHT, font=(FONT, 11)).pack(expand=True)
-        if HAS_DND:
-            drop.drop_target_register(DND_FILES)
-            drop.dnd_bind("<<Drop>>", self._handle_drop)
+    # ------------------------------------------------------------ layout ---
+    def _build(self):
+        outer = ttk.Frame(self.root, padding=(28, 22, 28, 20))
+        outer.pack(fill=tk.BOTH, expand=True)
 
-        # Folder row
-        row = tk.Frame(self.root, bg=BG_DARK)
-        row.pack(fill=tk.X, pady=(0, 10))
-        self.btn_browse = self._button(row, "Browse Folder", self._browse)
-        self.btn_browse.pack(side=tk.LEFT)
-        self.lbl_path = tk.Label(row, text="No folders selected", fg=FG_MUTED, bg=BG_DARK,
-                                 font=(FONT, 9, "italic"), anchor="w")
-        self.lbl_path.pack(side=tk.LEFT, padx=(15, 0), fill=tk.X, expand=True)
+        # Header
+        head = ttk.Frame(outer)
+        head.pack(fill=tk.X)
+        titles = ttk.Frame(head)
+        titles.pack(side=tk.LEFT)
+        ttk.Label(titles, text="Drone Pitch Sorter", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(titles, text="Sorts DJI photos into folders by gimbal angle",
+                  style="Sub.TLabel").pack(anchor="w", pady=(2, 0))
+        ttk.Button(head, text="◐", width=3, command=self._toggle_theme).pack(side=tk.RIGHT, anchor="n")
+        ttk.Label(head, text=f"v{__version__}", style="Muted.TLabel").pack(side=tk.RIGHT, anchor="n",
+                                                                          padx=(0, 10), pady=(8, 0))
 
-        # Options row
-        opts = tk.Frame(self.root, bg=BG_DARK)
-        opts.pack(fill=tk.X, pady=(0, 10))
-        radio_kw = dict(bg=BG_DARK, fg=FG_LIGHT, selectcolor=BG_CARD, activebackground=BG_DARK,
-                        activeforeground=FG_LIGHT, font=(FONT, 9))
-        tk.Radiobutton(opts, text="Copy", variable=self.mode, value="copy", **radio_kw).pack(side=tk.LEFT)
-        tk.Radiobutton(opts, text="Move", variable=self.mode, value="move", **radio_kw).pack(side=tk.LEFT, padx=(6, 0))
-        tk.Checkbutton(opts, text="Dry run (preview only)", variable=self.dry_run, **radio_kw).pack(side=tk.LEFT, padx=(16, 0))
-        tk.Label(opts, text="Tolerance ±°", bg=BG_DARK, fg=FG_MUTED, font=(FONT, 9)).pack(side=tk.LEFT, padx=(16, 4))
-        tk.Entry(opts, textvariable=self.tolerance, width=5, bg=BG_CARD, fg=FG_LIGHT,
-                 insertbackground=FG_LIGHT, bd=0, font=(FONT, 9)).pack(side=tk.LEFT)
-        self.btn_config = self._button(opts, "Edit Categories", self._open_config)
+        # Step 1: folders
+        self._step(outer, "1", "Choose flight folders")
+        card = ttk.Frame(outer, style="Card.TFrame", padding=16)
+        card.pack(fill=tk.X)
+        drop = ttk.Frame(card)
+        drop.pack(fill=tk.X)
+        self.drop_icon = ttk.Label(drop, text="⇩", font=_font(26))
+        self.drop_icon.pack(side=tk.LEFT, padx=(4, 14))
+        drop_txt = ttk.Frame(drop)
+        drop_txt.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Label(drop_txt, text="Drop flight folders anywhere on this window" if HAS_DND
+                  else "Add the folders you want to sort", font=_font(11, "bold")).pack(anchor="w")
+        self.lbl_folders = ttk.Label(drop_txt, text="No folders added yet", style="Muted.TLabel")
+        self.lbl_folders.pack(anchor="w", pady=(2, 0))
+        self.btn_clear = ttk.Button(drop, text="Clear", command=self._clear_sources)
+        self.btn_clear.pack(side=tk.RIGHT, padx=(8, 0))
+        self.btn_browse = ttk.Button(drop, text="Add folder…", command=self._browse)
+        self.btn_browse.pack(side=tk.RIGHT)
+
+        # Step 2: options
+        self._step(outer, "2", "Choose how to sort")
+        card2 = ttk.Frame(outer, style="Card.TFrame", padding=16)
+        card2.pack(fill=tk.X)
+        row = ttk.Frame(card2)
+        row.pack(fill=tk.X)
+        seg = ttk.Frame(row)
+        seg.pack(side=tk.LEFT)
+        self.rb_copy = ttk.Radiobutton(seg, text="Copy", value="copy", variable=self.mode,
+                                       style="Toggle.TButton", width=8)
+        self.rb_copy.pack(side=tk.LEFT)
+        self.rb_move = ttk.Radiobutton(seg, text="Move", value="move", variable=self.mode,
+                                       style="Toggle.TButton", width=8)
+        self.rb_move.pack(side=tk.LEFT, padx=(4, 0))
+        self.sw_preview = ttk.Checkbutton(row, text="Preview only", variable=self.preview,
+                                          style="Switch.TCheckbutton")
+        self.sw_preview.pack(side=tk.LEFT, padx=(24, 0))
+        self.btn_config = ttk.Button(row, text="Edit angles…", command=self._open_config)
         self.btn_config.pack(side=tk.RIGHT)
+        tol = ttk.Frame(row)
+        tol.pack(side=tk.RIGHT, padx=(0, 16))
+        ttk.Label(tol, text="Tolerance ±").pack(side=tk.LEFT)
+        self.spin_tol = ttk.Spinbox(tol, from_=0.1, to=10, increment=0.1, width=5,
+                                    textvariable=self.tolerance)
+        self.spin_tol.pack(side=tk.LEFT, padx=(6, 4))
+        ttk.Label(tol, text="°").pack(side=tk.LEFT)
+        self.lbl_mode = ttk.Label(card2, style="Muted.TLabel", wraplength=740, justify="left")
+        self.lbl_mode.pack(anchor="w", pady=(12, 0))
 
-        # Action row
-        act = tk.Frame(self.root, bg=BG_DARK)
-        act.pack(fill=tk.X, pady=(0, 10))
-        self.btn_start = self._button(act, "Start Sorting", self._start, bg=ACCENT_GREEN, fg=BG_DARK, state=tk.DISABLED)
-        self.btn_start.pack(side=tk.RIGHT)
-        self.btn_cancel = self._button(act, "Cancel", self._cancel, state=tk.DISABLED)
-        self.btn_cancel.pack(side=tk.RIGHT, padx=(0, 8))
-        self.progress = ttk.Progressbar(act, style="Horizontal.TProgressbar", mode="determinate", maximum=100)
-        self.progress.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=(6, 0))
-        self.lbl_eta = tk.Label(act, text="", bg=BG_DARK, fg=FG_MUTED, font=(FONT, 9, "bold"), width=22, anchor="e")
-        self.lbl_eta.pack(side=tk.LEFT, padx=(10, 10))
+        # Step 3: run
+        self._step(outer, "3", "Sort")
+        run = ttk.Frame(outer)
+        run.pack(fill=tk.X)
+        self.btn_start = ttk.Button(run, text="Sort photos", style="Accent.TButton",
+                                    command=self._start, width=22)
+        self.btn_start.pack(side=tk.LEFT)
+        self.btn_cancel = ttk.Button(run, text="Cancel", command=self._cancel)
+        self.btn_cancel.pack(side=tk.LEFT, padx=(8, 0))
+        self.btn_undo = ttk.Button(run, text="Undo a move…", command=self._undo)
+        self.btn_undo.pack(side=tk.RIGHT)
+        prog = ttk.Frame(outer)
+        prog.pack(fill=tk.X, pady=(14, 0))
+        self.progress = ttk.Progressbar(prog, mode="determinate", maximum=100)
+        self.progress.pack(fill=tk.X)
+        self.lbl_status = ttk.Label(prog, text=" ", style="Status.TLabel")
+        self.lbl_status.pack(anchor="w", pady=(6, 0))
 
-        # Log
-        self.log_area = scrolledtext.ScrolledText(
-            self.root, height=14, state=tk.DISABLED, font=("Consolas", 9),
-            bg=BG_TEXT, fg=FG_LIGHT, insertbackground=FG_LIGHT, bd=0,
-            highlightbackground=BG_CARD, highlightthickness=1,
-        )
-        self.log_area.pack(fill=tk.BOTH, expand=True)
-        for tag, color in (("ok", ACCENT_GREEN), ("warn", ACCENT_YELLOW), ("err", ACCENT_RED), ("muted", FG_MUTED)):
-            self.log_area.tag_config(tag, foreground=color)
+        # Results / activity tabs
+        tabs = ttk.Notebook(outer)
+        tabs.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+
+        res_tab = ttk.Frame(tabs, padding=(0, 8, 0, 0))
+        tabs.add(res_tab, text="  Results  ")
+        self.results = ttk.Treeview(res_tab, columns=("photos", "share"), show="tree headings",
+                                    selectmode="none", height=8)
+        self.results.heading("#0", text="   Folder", anchor="w")
+        self.results.heading("photos", text="Photos", anchor="e")
+        self.results.heading("share", text="Share", anchor="e")
+        self.results.column("#0", stretch=True, anchor="w")
+        self.results.column("photos", width=110, stretch=False, anchor="e")
+        self.results.column("share", width=110, stretch=False, anchor="e")
+        self.results.pack(fill=tk.BOTH, expand=True)
+
+        log_tab = ttk.Frame(tabs, padding=(0, 8, 0, 0))
+        tabs.add(log_tab, text="  Activity  ")
+        self.log_text = tk.Text(log_tab, height=8, wrap="none", bd=0, highlightthickness=0,
+                                font=("Cascadia Mono", 9) if os.name == "nt" else ("DejaVu Sans Mono", 9),
+                                padx=10, pady=8, state=tk.DISABLED)
+        sb = ttk.Scrollbar(log_tab, command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.tabs = tabs
+
+        self._style_text()
+        self._set_running(False)
+
+        if HAS_DND:
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind("<<Drop>>", self._handle_drop)
+
+    def _step(self, parent, num: str, text: str):
+        f = ttk.Frame(parent)
+        f.pack(fill=tk.X, pady=(20, 8))
+        ttk.Label(f, text=f"{num}   {text}", style="Step.TLabel").pack(side=tk.LEFT)
 
     # --------------------------------------------------------------- log ---
-    def _log(self, *lines: tuple[str, str] | str):
-        """Append lines on the UI thread. Each line is text or (text, tag)."""
-        at_bottom = self.log_area.yview()[1] >= 0.98
-        self.log_area.config(state=tk.NORMAL)
+    def _log(self, *lines):
+        """Append lines; each line is text or (text, tag)."""
+        at_bottom = self.log_text.yview()[1] >= 0.98
+        self.log_text.config(state=tk.NORMAL)
         for line in lines:
             text, tag = (line, None) if isinstance(line, str) else line
-            self.log_area.insert(tk.END, text + "\n", tag or ())
+            self.log_text.insert(tk.END, text + "\n", tag or ())
         if at_bottom:
-            self.log_area.see(tk.END)
-        self.log_area.config(state=tk.DISABLED)
+            self.log_text.see(tk.END)
+        self.log_text.config(state=tk.DISABLED)
 
     # ----------------------------------------------------------- folders ---
     def _handle_drop(self, event):
@@ -172,27 +268,63 @@ class DroneSorterApp:
         paths = [Path(p) for p in self.root.tk.splitlist(event.data)]
         dirs = [p for p in paths if p.is_dir()]
         if dirs:
-            self._set_sources(dirs)
+            self._add_sources(dirs)
         else:
-            self._log(("Dropped items must be folders.", "err"))
+            self._log(("Only folders can be dropped here.", "err"))
 
     def _browse(self):
-        folder = filedialog.askdirectory()
+        folder = filedialog.askdirectory(title="Choose a flight folder")
         if folder:
-            self._set_sources([Path(folder)])
+            self._add_sources([Path(folder)])
 
-    def _set_sources(self, dirs: list[Path]):
-        self.source_dirs = dirs
-        label = dirs[0].name if len(dirs) == 1 else f"{len(dirs)} folders queued"
-        self.lbl_path.config(text=label, fg=ACCENT_BLUE)
-        self.btn_start.config(state=tk.NORMAL)
+    def _add_sources(self, dirs: list[Path]):
+        for d in dirs:
+            if d not in self.source_dirs:
+                self.source_dirs.append(d)
+        self._sources_changed()
+
+    def _clear_sources(self):
+        self.source_dirs = []
+        self._sources_changed()
+
+    def _sources_changed(self):
+        n = len(self.source_dirs)
+        if n == 0:
+            self.lbl_folders.config(text="No folders added yet")
+        elif n == 1:
+            self.lbl_folders.config(text=str(self.source_dirs[0]))
+        else:
+            names = ", ".join(d.name for d in self.source_dirs[:4])
+            more = f" and {n - 4} more" if n > 4 else ""
+            self.lbl_folders.config(text=f"{n} folders: {names}{more}")
         self.progress["value"] = 0
-        self.lbl_eta.config(text="", fg=FG_MUTED)
-        self._log(f"Queued {len(dirs)} folder(s): " + ", ".join(str(d) for d in dirs))
+        self.lbl_status.config(text=" ")
+        self.photo_count = None
+        self._refresh_start_button()
+        if n:
+            self._count_photos()
+
+    def _count_photos(self, show_status: bool = True):
+        """Count photos in the background so the button can say how many."""
+        self._count_token += 1
+        self._count_shows_status = show_status
+        token, dirs = self._count_token, list(self.source_dirs)
+        cats = self._categories(silent=True) or []
+        names = {c.name for c in cats} | {UNSORTED}
+        if show_status:
+            self.lbl_status.config(text="Looking for photos…")
+
+        def work():
+            try:
+                n = len(find_images(dirs, names))
+            except OSError:
+                n = None
+            self.events.put(("count", token, n))
+        threading.Thread(target=work, daemon=True).start()
 
     def _open_config(self):
         if not self.config_file:
-            messagebox.showerror("Categories", "Couldn't create categories.json next to the app.")
+            messagebox.showerror("Angles", "Couldn't create categories.json next to the app.")
             return
         path = str(self.config_file)
         try:
@@ -203,41 +335,74 @@ class DroneSorterApp:
             else:
                 subprocess.Popen(["xdg-open", path])
         except OSError as e:
-            messagebox.showerror("Categories", f"Couldn't open {path}\n\n{e}")
+            messagebox.showerror("Angles", f"Couldn't open {path}\n\n{e}")
             return
-        self._log(("Edit and save categories.json; changes apply on the next run.", "muted"))
+        self._log(("Edit and save categories.json. Changes apply the next time you sort.", "muted"))
 
-    # --------------------------------------------------------------- run ---
+    # ----------------------------------------------------------- state ---
     def _busy(self) -> bool:
         return self.worker is not None and self.worker.is_alive()
 
+    def _refresh_mode(self):
+        self.lbl_mode.config(text=MODE_HELP[self.mode.get()])
+        self._refresh_start_button()
+
+    def _refresh_start_button(self):
+        verb = "Preview" if self.preview.get() else ("Move" if self.mode.get() == "move" else "Copy")
+        if self.photo_count:
+            self.btn_start.config(text=f"{verb} {self.photo_count:,} photos")
+        else:
+            self.btn_start.config(text=f"{verb} photos")
+        if not self._busy():
+            ready = bool(self.source_dirs) and self.photo_count != 0
+            self.btn_start.state(["!disabled"] if ready else ["disabled"])
+
+    def _set_running(self, running: bool):
+        for w in (self.btn_start, self.btn_browse, self.btn_clear, self.btn_config, self.btn_undo,
+                  self.rb_copy, self.rb_move, self.sw_preview, self.spin_tol):
+            w.state(["disabled"] if running else ["!disabled"])
+        self.btn_cancel.state(["!disabled"] if running else ["disabled"])
+        if not running:
+            self._refresh_start_button()
+
+    def _categories(self, silent=False):
+        try:
+            text = self.tolerance.get().strip()
+            tol = float(text) if text else None
+            cats = categories_from_config(load_config(self.config_file), tol)
+        except (ValueError, KeyError, TypeError) as e:
+            if not silent:
+                messagebox.showerror("Settings", f"The tolerance or categories.json isn't valid:\n\n{e}")
+            return None
+        if not cats and not silent:
+            messagebox.showerror("Settings", "categories.json doesn't list any angles.")
+            return None
+        return cats
+
+    # --------------------------------------------------------------- run ---
     def _start(self):
         if not self.source_dirs or self._busy():
             return
-        try:
-            tol_text = self.tolerance.get().strip()
-            tolerance = float(tol_text) if tol_text else None
-            categories = categories_from_config(load_config(self.config_file), tolerance)
-        except (ValueError, KeyError, TypeError) as e:
-            messagebox.showerror("Settings", f"Invalid tolerance or categories.json:\n\n{e}")
-            return
+        categories = self._categories()
         if not categories:
-            messagebox.showerror("Settings", "categories.json has no categories.")
             return
-
-        move = self.mode.get() == "move"
-        dry = self.dry_run.get()
+        move, dry = self.mode.get() == "move", self.preview.get()
         if move and not dry and not messagebox.askyesno(
-            "Move files?", "Move mode takes the originals out of the flight folders. Continue?"
+            "Move photos?",
+            "Photos will be moved into category folders inside each flight folder.\n\n"
+            "Nothing is deleted or overwritten, and a sort log is saved so you can "
+            "undo this with \"Undo a move…\".\n\nContinue?",
         ):
             return
 
         self.cancel_event.clear()
         self._set_running(True)
         self.progress["value"] = 0
+        self.results.delete(*self.results.get_children())
         self.start_time = time.monotonic()
+        self.lbl_status.config(text="Starting…")
         verb = "Previewing" if dry else ("Moving" if move else "Copying")
-        self._log("", (f"--- {verb} photos ---", "muted"))
+        self._log("", (f"— {verb} photos —", "muted"))
 
         def work():
             try:
@@ -246,8 +411,8 @@ class DroneSorterApp:
                     on_progress=lambda i, n, r: self.events.put(("progress", i, n, r)),
                     cancel=self.cancel_event,
                 )
-                self.events.put(("done", results, dry))
-            except Exception as e:  # report anything unexpected in the log
+                self.events.put(("done", results, dry, move))
+            except Exception as e:
                 self.events.put(("fatal", e))
 
         self.worker = threading.Thread(target=work, daemon=True)
@@ -255,90 +420,149 @@ class DroneSorterApp:
 
     def _cancel(self):
         self.cancel_event.set()
-        self.btn_cancel.config(state=tk.DISABLED)
-        self.lbl_eta.config(text="Cancelling...", fg=ACCENT_YELLOW)
+        self.btn_cancel.state(["disabled"])
+        self.lbl_status.config(text="Stopping after the current photo…")
 
-    def _set_running(self, running: bool):
-        on, off = (tk.DISABLED, tk.NORMAL) if running else (tk.NORMAL, tk.DISABLED)
-        self.btn_start.config(state=on)
-        self.btn_browse.config(state=on)
-        self.btn_config.config(state=on)
-        self.btn_cancel.config(state=off)
+    def _undo(self):
+        initial = str(self.source_dirs[0]) if self.source_dirs else None
+        path = filedialog.askopenfilename(
+            title="Choose the sort log to undo", initialdir=initial,
+            filetypes=[("Sort logs", "Sort log *.csv"), ("CSV files", "*.csv")],
+        )
+        if not path or not messagebox.askyesno(
+            "Undo move?", "Moved photos in this log go back to where they came from.\n"
+                          "Nothing is overwritten. Continue?"):
+            return
+        self._set_running(True)
+        self.btn_cancel.state(["disabled"])
+        self.lbl_status.config(text="Putting photos back…")
 
+        def work():
+            try:
+                self.events.put(("undone", undo_sort_log(Path(path))))
+            except Exception as e:
+                self.events.put(("fatal", e))
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
+
+    # ------------------------------------------------------------ events ---
     def _poll_events(self):
-        lines = []
-        last_progress = None
+        lines, last = [], None
         try:
-            while len(lines) < MAX_LOG_LINES_PER_POLL:
+            for _ in range(MAX_EVENTS_PER_POLL):
                 ev = self.events.get_nowait()
                 if ev[0] == "progress":
-                    _, i, n, r = ev
-                    last_progress = (i, n)
-                    lines.append(self._format_result(r))
-                else:
-                    if lines:
-                        self._log(*lines)
-                        lines = []
-                    self._handle_final(ev)
+                    last = ev[1:3]
+                    lines.append(self._format_result(ev[3]))
+                    continue
+                if lines:
+                    self._log(*lines)
+                    lines = []
+                if last:  # apply progress before a "done" event, not after it
+                    self._update_progress(*last)
+                    last = None
+                self._handle_event(ev)
         except queue.Empty:
             pass
         if lines:
             self._log(*lines)
-        if last_progress:
-            self._update_progress(*last_progress)
+        if last:
+            self._update_progress(*last)
         self.root.after(POLL_MS, self._poll_events)
+
+    def _handle_event(self, ev):
+        kind = ev[0]
+        if kind == "count":
+            _, token, n = ev
+            if token == self._count_token:
+                self.photo_count = n
+                if self._count_shows_status:
+                    self.lbl_status.config(
+                        text="No photos found in these folders (already sorted?)" if n == 0
+                        else f"{n:,} photos ready to sort" if n else " ")
+                self._refresh_start_button()
+        elif kind == "done":
+            self._finish(*ev[1:])
+        elif kind == "undone":
+            self._set_running(False)
+            counts = Counter(s for s, _, _ in ev[1])
+            for status, path, detail in ev[1]:
+                if status != "restored":
+                    self._log((f"{status:9} {path.name}: {detail}", "warn"))
+            self._log((f"Undo finished: {counts.get('restored', 0):,} photos put back.", "ok"))
+            self.lbl_status.config(text=f"Undo finished: {counts.get('restored', 0):,} photos put back")
+            if self.source_dirs:
+                self._count_photos(show_status=False)
+        elif kind == "fatal":
+            self._set_running(False)
+            self._log((f"Something went wrong: {ev[1]}", "err"))
+            self.lbl_status.config(text=f"Something went wrong: {ev[1]}")
 
     @staticmethod
     def _format_result(r):
         pitch = f"{r.pitch:6.1f}°" if r.pitch is not None else "   N/A "
-        name = f"[{r.source.parent.name}] {r.source.name}"
+        name = f"{r.source.parent.name}/{r.source.name}"
         if r.action == "error":
-            return (f"ERROR  {name}: {r.error}", "err")
-        dest = r.dest.name if r.dest and r.dest.name != r.source.name else ""
-        extra = f" as {dest}" if dest else ""
+            return (f"error     {name}: {r.error}", "err")
+        renamed = f"  (saved as {r.dest.name})" if r.dest and r.dest.name != r.source.name else ""
         tag = "warn" if r.category == UNSORTED or r.action == "skipped" else None
-        return (f"{r.action:8} {pitch}  {name} -> {r.category}/{extra}", tag)
+        return (f"{r.action:9} {pitch}  {name}  →  {r.category}{renamed}", tag)
 
     def _update_progress(self, i: int, n: int):
         self.progress["value"] = (i / n) * 100 if n else 100
+        if self.cancel_event.is_set():
+            return
         elapsed = time.monotonic() - self.start_time
-        if self.cancel_event.is_set() or elapsed < 0.5 or i == 0:
-            return
-        rate = i / elapsed
-        remaining = int((n - i) / rate) if rate else 0
-        mins, secs = divmod(remaining, 60)
-        eta = f"{mins}m {secs}s" if mins else f"{secs}s"
-        self.lbl_eta.config(text=f"{i}/{n} · {rate:.0f}/s · {eta}", fg=FG_LIGHT)
+        text = f"{i:,} of {n:,}"
+        if elapsed > 0.5 and i:
+            rate = i / elapsed
+            left = int((n - i) / rate)
+            mins, secs = divmod(left, 60)
+            text += f"  ·  {rate:,.0f} photos/s  ·  about {f'{mins}m {secs}s' if mins else f'{secs}s'} left"
+        self.lbl_status.config(text=text)
 
-    def _handle_final(self, ev):
+    def _finish(self, results, dry, move):
         self._set_running(False)
-        if ev[0] == "fatal":
-            self._log((f"An error occurred: {ev[1]}", "err"))
-            self.lbl_eta.config(text="Error", fg=ACCENT_RED)
-            return
-
-        _, results, dry = ev
         cancelled = self.cancel_event.is_set()
         if not results:
-            self._log(("No photos found to sort.", "warn"))
-            self.lbl_eta.config(text="Nothing to do", fg=FG_MUTED)
+            self.lbl_status.config(text="No photos to sort.")
             return
-
         elapsed = time.monotonic() - self.start_time
         by_cat = Counter(r.category for r in results)
         by_action = Counter(r.action for r in results)
-        title = "Preview" if dry else ("Cancelled" if cancelled else "Complete")
-        summary = [("", None), (f"--- {title}: {len(results)} photos in {elapsed:.1f}s ---", "ok")]
-        width = max(len(c) for c in by_cat)
-        for cat, count in sorted(by_cat.items()):
-            summary.append((f"  {cat:<{width}}  {count:>6}", "warn" if cat == UNSORTED else None))
-        summary.append(("  " + ", ".join(f"{a}: {c}" for a, c in sorted(by_action.items())), "muted"))
-        self._log(*summary)
-        self.progress["value"] = 100 if not cancelled else self.progress["value"]
-        self.lbl_eta.config(text=title, fg=ACCENT_YELLOW if cancelled else ACCENT_GREEN)
+        total = len(results)
+
+        for cat, count in sorted(by_cat.items(), key=lambda kv: (kv[0] == UNSORTED, -kv[1])):
+            self.results.insert("", tk.END, text=f"  {cat}", values=(f"{count:,}", f"{count / total:.0%}"),
+                                tags=("unsorted",) if cat == UNSORTED else ())
+
+        done_word = {"copied": "copied", "moved": "moved", "planned": "would be sorted",
+                     "skipped": "already sorted", "error": "failed"}
+        parts = [f"{c:,} {done_word.get(a, a)}" for a, c in by_action.items()]
+        head = "Preview" if dry else ("Stopped" if cancelled else "Done")
+        summary = f"{head}: {', '.join(parts)} in {elapsed:.1f}s"
+        if move and not dry and by_action.get("moved"):
+            summary += "  ·  sort log saved in each folder"
+        self.lbl_status.config(text=summary)
+        self._log((summary, "err" if by_action.get("error") else "ok"))
+        if not cancelled:
+            self.progress["value"] = 100
+        if not dry:
+            self._count_photos(show_status=False)
+
+
+def _enable_crisp_text_on_windows():
+    """Without this, Windows scales the window up as a blurry bitmap on high-DPI screens."""
+    if os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
 
 
 def main():
+    _enable_crisp_text_on_windows()
     root = TkinterDnD.Tk() if HAS_DND else tk.Tk()
     DroneSorterApp(root)
     root.mainloop()

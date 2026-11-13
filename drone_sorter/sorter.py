@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-import filecmp
+import csv
 import json
+import os
 import shutil
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -134,6 +136,24 @@ def find_images(sources: Iterable[Path], output_names: set[str]) -> list[Path]:
 
 
 # ------------------------------------------------------------- placement ---
+#
+# SAFETY RULES for everything below:
+#   * An existing file is never overwritten.
+#   * An original is only removed after its new copy is confirmed to exist
+#     and be identical. There is no code path that deletes a photo outright.
+
+def same_bytes(a: Path, b: Path, bufsize: int = 1024 * 1024) -> bool:
+    """True if two files have identical contents (full byte comparison)."""
+    if os.path.getsize(a) != os.path.getsize(b):
+        return False
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        while True:
+            ca, cb = fa.read(bufsize), fb.read(bufsize)
+            if ca != cb:
+                return False
+            if not ca:
+                return True
+
 
 def _unique_dest(dest: Path) -> Path:
     stem, suffix = dest.stem, dest.suffix
@@ -145,25 +165,169 @@ def _unique_dest(dest: Path) -> Path:
         n += 1
 
 
+def safe_move(src: Path, dest: Path) -> None:
+    """Move ``src`` to ``dest`` without any chance of losing a photo.
+
+    Raises FileExistsError (and changes nothing) if ``dest`` already exists.
+    """
+    src, dest = Path(src), Path(dest)
+
+    # 1) Hard link + unlink. The OS refuses to create the link if dest exists,
+    #    no data is copied, and the original name is removed only once the new
+    #    name is confirmed to point at the very same file.
+    try:
+        os.link(src, dest)
+    except FileExistsError:
+        raise
+    except (OSError, NotImplementedError, AttributeError):
+        pass  # e.g. exFAT/FAT32 SD cards don't support hard links
+    else:
+        if not os.path.samefile(src, dest):
+            raise OSError(f"Link check failed; original kept: {src}")
+        os.unlink(src)
+        return
+
+    # 2) Windows: a same-drive rename is atomic and never overwrites.
+    if os.name == "nt":
+        os.rename(src, dest)
+        return
+
+    # 3) Fallback: copy into a brand-new file (refuses to overwrite), flush it
+    #    to disk, verify it byte-for-byte, and only then remove the original.
+    created = False
+    try:
+        with open(src, "rb") as fsrc, open(dest, "xb") as fdst:
+            created = True
+            shutil.copyfileobj(fsrc, fdst, 1024 * 1024)
+            fdst.flush()
+            os.fsync(fdst.fileno())
+        shutil.copystat(src, dest)
+        if not same_bytes(src, dest):
+            raise OSError(f"Copy check failed; original kept: {src}")
+    except BaseException:
+        if created:  # only ever clean up our own partial copy, never the original
+            try:
+                os.unlink(dest)
+            except OSError:
+                pass
+        raise
+    os.unlink(src)
+
+
 def place_file(src: Path, category: str, move: bool, dry_run: bool) -> tuple[Path, str]:
     """Put ``src`` into ``<its folder>/<category>/``. Returns (dest, action)."""
     target_dir = src.parent / category
     dest = target_dir / src.name
 
     if dest.exists():
-        if filecmp.cmp(src, dest, shallow=False):
-            return dest, "skipped"          # already sorted, identical file
+        if same_bytes(src, dest):
+            return dest, "skipped"          # already sorted; original left untouched
         dest = _unique_dest(dest)           # same name, different photo
 
     if dry_run:
         return dest, "planned"
 
     target_dir.mkdir(parents=True, exist_ok=True)
-    if move:
-        shutil.move(str(src), str(dest))
-        return dest, "moved"
-    shutil.copy2(src, dest)
-    return dest, "copied"
+    for _ in range(100):
+        try:
+            if move:
+                safe_move(src, dest)
+                return dest, "moved"
+            _safe_copy(src, dest)
+            return dest, "copied"
+        except FileExistsError:
+            dest = _unique_dest(dest)       # something appeared there meanwhile
+    raise OSError(f"Could not find a free file name for {src.name}")
+
+
+def _safe_copy(src: Path, dest: Path) -> None:
+    """copy2, but refuses to overwrite an existing file."""
+    created = False
+    try:
+        with open(src, "rb") as fsrc, open(dest, "xb") as fdst:
+            created = True
+            shutil.copyfileobj(fsrc, fdst, 1024 * 1024)
+        shutil.copystat(src, dest)
+    except BaseException:
+        if created:  # remove our own partial copy; the original is untouched
+            try:
+                os.unlink(dest)
+            except OSError:
+                pass
+        raise
+
+
+# ------------------------------------------------------------ sort log ---
+
+LOG_FIELDS = ["action", "original", "new_location", "pitch", "category"]
+
+
+def log_name(when: datetime) -> str:
+    return f"Sort log {when:%Y-%m-%d %H-%M-%S}.csv"
+
+
+class SortLog:
+    """Writes one CSV per source folder, a row at a time, so the record is
+    complete even if the app is closed mid-run. Used by ``undo_sort_log``."""
+
+    def __init__(self, when: datetime):
+        self.when = when
+        self._files: dict[Path, tuple] = {}
+        self.paths: list[Path] = []
+
+    def add(self, root: Path, res: "FileResult") -> None:
+        if root not in self._files:
+            path = root / log_name(self.when)
+            fh = open(path, "w", newline="", encoding="utf-8")
+            writer = csv.writer(fh)
+            writer.writerow(LOG_FIELDS)
+            self._files[root] = (fh, writer)
+            self.paths.append(path)
+        fh, writer = self._files[root]
+        pitch = "" if res.pitch is None else f"{res.pitch}"
+        writer.writerow([res.action, str(res.source), str(res.dest), pitch, res.category])
+        fh.flush()
+
+    def close(self) -> None:
+        for fh, _ in self._files.values():
+            fh.close()
+
+
+def undo_sort_log(log_path: Path) -> list[tuple[str, Path, str]]:
+    """Put moved photos back where they came from, using a sort log.
+
+    Returns (status, original_path, detail) per row. Copies are left alone
+    (the originals were never touched). Nothing is ever overwritten: if a file
+    already sits at the original location, that row is skipped.
+    """
+    log_path = Path(log_path)
+    out = []
+    with open(log_path, newline="", encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    for row in rows:
+        original, current = Path(row["original"]), Path(row["new_location"])
+        if row["action"] != "moved":
+            out.append(("left", original, f"was {row['action']}, nothing to undo"))
+            continue
+        if not current.exists():
+            out.append(("missing", original, f"not found at {current}"))
+            continue
+        try:
+            original.parent.mkdir(parents=True, exist_ok=True)
+            safe_move(current, original)
+            out.append(("restored", original, ""))
+        except FileExistsError:
+            out.append(("skipped", original, "a file already exists at the original location"))
+        except OSError as e:
+            out.append(("error", original, str(e)))
+    for folder in {Path(r["new_location"]).parent for r in rows if r["action"] == "moved"}:
+        try:
+            folder.rmdir()  # only succeeds if the category folder is now empty
+        except OSError:
+            pass
+    if all(status in ("restored", "left") for status, _, _ in out):
+        log_path.rename(log_path.with_name(log_path.stem + " (undone).csv"))
+    return out
 
 
 # ------------------------------------------------------------------- run ---
@@ -176,34 +340,52 @@ def sort_photos(
     on_progress: Callable[[int, int, FileResult], None] | None = None,
     cancel: threading.Event | None = None,
     workers: int = 8,
+    write_log: bool = True,
 ) -> list[FileResult]:
     """Sort every photo under ``sources``. Pitch reading runs in parallel;
-    file placement is sequential so name-collision handling stays safe."""
-    output_names = {c.name for c in categories} | {UNSORTED}
-    images = find_images(sources, output_names)
-    total = len(images)
-    results: list[FileResult] = []
+    file placement is sequential so name-collision handling stays safe.
 
-    def read(p: Path) -> tuple[float | None, str]:
+    Unless ``dry_run``, a "Sort log <date>.csv" is written into each source
+    folder recording where every photo went (see ``undo_sort_log``)."""
+    output_names = {c.name for c in categories} | {UNSORTED}
+    jobs: list[tuple[Path, Path]] = []
+    seen: set[Path] = set()
+    for root in sources:
+        for img in find_images([root], output_names):
+            key = img.resolve()
+            if key not in seen:
+                seen.add(key)
+                jobs.append((Path(root), img))
+    total = len(jobs)
+    results: list[FileResult] = []
+    log = SortLog(datetime.now()) if (write_log and not dry_run) else None
+
+    def read(job: tuple[Path, Path]) -> tuple[float | None, str]:
         try:
-            return read_gimbal_pitch(p), ""
+            return read_gimbal_pitch(job[1]), ""
         except OSError as e:
             return None, str(e)
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        for i, (img, (pitch, read_err)) in enumerate(zip(images, pool.map(read, images)), 1):
-            if cancel is not None and cancel.is_set():
-                pool.shutdown(wait=False, cancel_futures=True)
-                break
-            category = assign_category(pitch, categories)
-            try:
-                dest, action = place_file(img, category, move, dry_run)
-                res = FileResult(img, pitch, category, dest, action, read_err)
-            except OSError as e:
-                res = FileResult(img, pitch, category, None, "error", str(e))
-            results.append(res)
-            if on_progress:
-                on_progress(i, total, res)
+    try:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for i, ((root, img), (pitch, read_err)) in enumerate(zip(jobs, pool.map(read, jobs)), 1):
+                if cancel is not None and cancel.is_set():
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+                category = assign_category(pitch, categories)
+                try:
+                    dest, action = place_file(img, category, move, dry_run)
+                    res = FileResult(img, pitch, category, dest, action, read_err)
+                except OSError as e:
+                    res = FileResult(img, pitch, category, None, "error", str(e))
+                if log is not None and res.action in ("moved", "copied"):
+                    log.add(root, res)
+                results.append(res)
+                if on_progress:
+                    on_progress(i, total, res)
+    finally:
+        if log is not None:
+            log.close()
     return results
 
 

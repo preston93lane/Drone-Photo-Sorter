@@ -13,7 +13,8 @@ CATS = categories_from_config(DEFAULT_CONFIG)
 
 
 def tree(root):
-    return sorted(str(p.relative_to(root)).replace("\\", "/") for p in root.rglob("*") if p.is_file())
+    return sorted(str(p.relative_to(root)).replace("\\", "/") for p in root.rglob("*")
+                  if p.is_file() and not p.name.startswith("Sort log"))
 
 
 @pytest.mark.parametrize("pitch,expected", [
