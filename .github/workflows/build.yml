@@ -30,6 +30,14 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements-dev.txt
+      - name: Check tag matches app version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          APP=$(python -c "import drone_sorter; print(drone_sorter.__version__)")
+          if [ "v$APP" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} doesn't match app version $APP"; exit 1
+          fi
       - name: Build single-file exe
         run: >
           pyinstaller --noconfirm --onefile --windowed

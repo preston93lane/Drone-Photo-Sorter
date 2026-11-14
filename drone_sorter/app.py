@@ -13,7 +13,7 @@ from collections import Counter
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__
+from . import __version__, updater
 from .sorter import (
     UNSORTED,
     categories_from_config,
@@ -98,6 +98,8 @@ class DroneSorterApp:
         self._refresh_mode()
         self._refresh_start_button()
         self._log("Ready. Gimbal pitch is read straight from each photo.")
+        self.release = None
+        self._start_update_check()
         self.root.after(POLL_MS, self._poll_events)
 
     # ------------------------------------------------------------- theme ---
@@ -143,8 +145,19 @@ class DroneSorterApp:
         outer.pack(fill=tk.BOTH, expand=True)
 
         # Header
+        # Update bar (hidden until an update is found)
+        self.banner = ttk.Frame(outer, style="Card.TFrame", padding=(14, 10))
+        self.lbl_update = ttk.Label(self.banner, font=_font(10, "bold"))
+        self.lbl_update.pack(side=tk.LEFT)
+        self.btn_later = ttk.Button(self.banner, text="Later", command=self.banner.pack_forget)
+        self.btn_later.pack(side=tk.RIGHT, padx=(8, 0))
+        self.btn_update = ttk.Button(self.banner, text="Update now", style="Accent.TButton",
+                                     command=self._install_update)
+        self.btn_update.pack(side=tk.RIGHT)
+
         head = ttk.Frame(outer)
         head.pack(fill=tk.X)
+        self.head = head
         titles = ttk.Frame(head)
         titles.pack(side=tk.LEFT)
         ttk.Label(titles, text="Drone Pitch Sorter", style="Title.TLabel").pack(anchor="w")
@@ -263,6 +276,35 @@ class DroneSorterApp:
         f = ttk.Frame(parent)
         f.pack(fill=tk.X, pady=(20, 8))
         ttk.Label(f, text=f"{num}   {text}", style="Step.TLabel").pack(side=tk.LEFT)
+
+    # ------------------------------------------------------------ update ---
+    def _start_update_check(self):
+        if not updater.can_self_update():
+            return
+        def work():
+            release = updater.check_for_update()
+            if release:
+                self.events.put(("update_found", release))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _install_update(self):
+        if not self.release:
+            return
+        if self._busy():
+            messagebox.showinfo("Update", "Please wait until sorting has finished.")
+            return
+        self.btn_update.state(["disabled"])
+        self.btn_later.state(["disabled"])
+        self.lbl_update.config(text=f"Downloading version {self.release.version}…")
+        release = self.release
+        def work():
+            try:
+                updater.download_and_install(
+                    release, on_progress=lambda f: self.events.put(("update_progress", f)))
+                self.events.put(("update_ready",))
+            except Exception as e:
+                self.events.put(("update_failed", e))
+        threading.Thread(target=work, daemon=True).start()
 
     # --------------------------------------------------------------- log ---
     def _log(self, *lines):
@@ -518,6 +560,24 @@ class DroneSorterApp:
             self.lbl_status.config(text=f"Undo finished: {counts.get('restored', 0):,} photos put back")
             if self.source_dirs:
                 self._count_photos(show_status=False)
+        elif kind == "update_found":
+            self.release = ev[1]
+            self.lbl_update.config(text=f"Version {self.release.version} is available")
+            self.banner.pack(fill=tk.X, pady=(0, 14), before=self.head)
+        elif kind == "update_progress":
+            self.lbl_update.config(text=f"Downloading version {self.release.version}…  {ev[1]:.0%}")
+        elif kind == "update_ready":
+            self.lbl_update.config(text="Restarting…")
+            try:
+                updater.relaunch()
+            except OSError as e:
+                messagebox.showinfo("Update installed",
+                                    f"The update is installed. Please reopen the app.\n\n({e})")
+            self.root.destroy()
+        elif kind == "update_failed":
+            self.btn_update.state(["!disabled"])
+            self.btn_later.state(["!disabled"])
+            self.lbl_update.config(text=f"Update didn't work, nothing was changed. ({ev[1]})")
         elif kind == "fatal":
             self._set_running(False)
             self._log((f"Something went wrong: {ev[1]}", "err"))
@@ -589,6 +649,7 @@ def _enable_crisp_text_on_windows():
 
 def main():
     _enable_crisp_text_on_windows()
+    updater.cleanup_old_versions()
     root = TkinterDnD.Tk() if HAS_DND else tk.Tk()
     DroneSorterApp(root)
     root.mainloop()

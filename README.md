@@ -9,6 +9,13 @@ camera's **gimbal pitch**: Tower Flight, Downlook, Uplook, and so on.
 (`drone-dji:GimbalPitchDegree="-40.00"`), so the app reads it directly. That makes it
 much faster too: hundreds of photos per second instead of ~2–3.
 
+## Updates
+
+The app checks GitHub for a newer version each time it opens. When one exists, a bar
+at the top offers **Update now**. It downloads the new version, swaps it in and
+restarts. Your `categories.json` settings are kept. If the download fails, nothing
+changes.
+
 ## Download & run (Windows)
 
 1. Go to the repo's **Releases** page and download `DronePitchSorter.exe`.
