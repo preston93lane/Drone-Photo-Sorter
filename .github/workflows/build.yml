@@ -30,13 +30,18 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements-dev.txt
-      - name: Check tag matches app version
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Is this a new version?
+        id: ver
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           APP=$(python -c "import drone_sorter; print(drone_sorter.__version__)")
-          if [ "v$APP" != "${GITHUB_REF_NAME}" ]; then
-            echo "Tag ${GITHUB_REF_NAME} doesn't match app version $APP"; exit 1
+          echo "version=$APP" >> "$GITHUB_OUTPUT"
+          if gh release view "v$APP" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
           fi
       - name: Build single-file exe
         run: >
@@ -49,9 +54,13 @@ jobs:
         with:
           name: DronePitchSorter-windows
           path: dist/DronePitchSorter.exe
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish GitHub Release (when the version number went up)
+        if: steps.ver.outputs.new == 'true' && github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: Drone Pitch Sorter ${{ steps.ver.outputs.version }}
+          target_commitish: ${{ github.sha }}
           files: dist/DronePitchSorter.exe
           generate_release_notes: true
+          make_latest: true

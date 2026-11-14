@@ -131,9 +131,6 @@ python -m pytest                  # tests
 
 ## Publishing a new version
 
-```bash
-git tag v6.0.0
-git push origin v6.0.0
-```
-
-GitHub Actions runs the tests, builds `DronePitchSorter.exe` and attaches it to a new Release.
+Raise `__version__` in `drone_sorter/__init__.py` and push. GitHub Actions runs the tests,
+builds `DronePitchSorter.exe` and publishes it as a new Release. Everyone's app then
+offers the update the next time it opens.
