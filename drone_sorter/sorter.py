@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
 
-import math
+
 
 from .pitch_reader import PhotoMeta, read_photo_meta
 
@@ -42,8 +42,8 @@ DEFAULT_CONFIG = {
     ],
     # Safety limit: a gap with more photos than this is left alone.
     "max_photos_between": 15,
-    # Photos in "category" whose camera faces AWAY from the tower go to "away_category".
-    # The tower position is the average GPS position of all photos in the folder.
+    # Two orbits at the same angle: photos after the ~180° camera-direction flip
+    # (from facing in to facing out) go to "away_category".
     "facing_rules": [
         {"category": "Center In", "away_category": "Center Out"},
     ],
@@ -182,49 +182,40 @@ def extra_folders_from_config(cfg: dict) -> list[str]:
     return [str(n).strip() for n in raw if str(n).strip()]
 
 
-MIN_DISTANCE_M = 8.0  # closer than this to the tower, "facing toward" is meaningless
+MIN_FLIP_DEGREES = 120.0  # a jump this big between two photos = switched orbits
 
 
-def _bearing_and_distance(lat1, lon1, lat2, lon2) -> tuple[float, float]:
-    """Compass bearing (degrees) and distance (metres) from point 1 to point 2."""
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dlon = math.radians(lon2 - lon1)
-    x = math.sin(dlon) * math.cos(p2)
-    y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dlon)
-    bearing = (math.degrees(math.atan2(x, y)) + 360) % 360
-    dy = (lat2 - lat1) * 111_320
-    dx = (lon2 - lon1) * 111_320 * math.cos(math.radians((lat1 + lat2) / 2))
-    return bearing, math.hypot(dx, dy)
+def _turn(a: float, b: float) -> float:
+    """Smallest angle between two compass directions (359 -> 1 is 2, not 358)."""
+    return abs((b - a + 180) % 360 - 180)
 
 
 def apply_facing_rules(
     metas: list[PhotoMeta], categories: list[str], rules: Iterable[tuple[str, str]]
 ) -> tuple[list[str], list[str]]:
-    """Split e.g. Center In / Center Out by whether the camera faces the tower.
+    """Split one angle set into two orbits by the camera-direction flip.
 
-    ``metas``/``categories`` are for ONE folder. The tower is taken to be the
-    average GPS position of every photo in the folder that has one. Photos
-    without GPS or camera direction, or right above the tower, are unchanged.
+    ``metas``/``categories`` are for ONE folder in shooting order. Among the
+    photos in ``category`` (e.g. Center In), find the biggest jump in camera
+    direction from one photo to the next. During an orbit each step is small;
+    switching from facing in to facing out is a jump of about 180 degrees. If
+    the biggest jump is over 120 degrees, every photo after it goes to
+    ``away_category`` (e.g. Center Out). No GPS is used.
     """
     cats = list(categories)
     reasons = [""] * len(cats)
-    rules = list(rules)
-    located = [m for m in metas if m.lat is not None and m.lon is not None]
-    if not rules or len(located) < 3:
-        return cats, reasons
-    c_lat = sum(m.lat for m in located) / len(located)
-    c_lon = sum(m.lon for m in located) / len(located)
-    for k, m in enumerate(metas):
-        for cat, away in rules:
-            if cats[k] != cat or m.yaw is None or m.lat is None or m.lon is None:
-                continue
-            bearing, dist = _bearing_and_distance(m.lat, m.lon, c_lat, c_lon)
-            if dist < MIN_DISTANCE_M:
-                continue
-            off = abs((m.yaw - bearing + 180) % 360 - 180)  # 0 = facing tower
-            if off > 90:
-                cats[k] = away
-                reasons[k] = "camera faces away from tower"
+    for cat, away in rules:
+        idxs = [k for k, c in enumerate(cats) if c == cat and metas[k].yaw is not None]
+        if len(idxs) < 2:
+            continue
+        jumps = [(_turn(metas[a].yaw, metas[b].yaw), pos)
+                 for pos, (a, b) in enumerate(zip(idxs, idxs[1:]), 1)]
+        biggest, split = max(jumps)
+        if biggest < MIN_FLIP_DEGREES:
+            continue
+        for k in idxs[split:]:
+            cats[k] = away
+            reasons[k] = f"second orbit (camera direction flipped {biggest:.0f}°)"
     return cats, reasons
 
 

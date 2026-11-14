@@ -79,16 +79,16 @@ switch off to sort by angle only.
 
 ## Center In vs Center Out
 
-Both orbits are shot at 0°, so the angle alone can't tell them apart. The app uses the
-camera direction and GPS position that DJI saves in every photo:
+Both orbits are shot at 0°, so the app uses your shot pattern instead:
 
-1. It finds the tower by averaging the GPS positions of all photos in the folder.
-2. For each 0° photo, it checks whether the camera was pointing toward that spot
-   (**Center In**) or away from it (**Center Out**). Anything within 90° of the
-   tower's direction counts as "toward".
+- In each folder, it looks at the camera's compass direction from one 0° photo to the next.
+- During an orbit, the direction changes a little with each photo (going from 359° to 1°
+  counts as a small step).
+- Switching from the Center In orbit to the Center Out orbit is a sudden jump of about
+  180°. Everything after the biggest jump goes to **Center Out**.
 
-The order and starting direction of the orbits don't matter. Photos without GPS stay
-in Center In.
+The jump only has to be more than 120°, so imperfect numbers are fine. If there's no
+big jump (only one orbit), everything stays in Center In. GPS isn't used.
 
 ## Access Road folder
 

@@ -591,7 +591,7 @@ class DroneSorterApp:
             return (f"error     {name}: {r.error}", "err")
         renamed = f"  (saved as {r.dest.name})" if r.dest and r.dest.name != r.source.name else ""
         tag = "warn" if r.category == UNSORTED or r.action == "skipped" else None
-        why = f"  ({r.rule})" if r.rule.startswith("camera") else (f"  (shot order: {r.rule})" if r.rule else "")
+        why = f"  ({r.rule})" if r.rule.startswith("second orbit") else (f"  (shot order: {r.rule})" if r.rule else "")
         return (f"{r.action:9} {pitch}  {name}  →  {r.category}{renamed}{why}", tag)
 
     def _update_progress(self, i: int, n: int):

@@ -1,7 +1,5 @@
 """Center In vs Center Out by camera direction, and the Access Road folder."""
 
-import math
-
 from drone_sorter.pitch_reader import read_photo_meta
 from drone_sorter.sorter import (
     DEFAULT_CONFIG, categories_from_config, extra_folders_from_config,
@@ -13,34 +11,8 @@ CFG = DEFAULT_CONFIG
 KW = dict(rules=rules_from_config(CFG), facing_rules=facing_rules_from_config(CFG),
           extra_folders=extra_folders_from_config(CFG))
 CATS = categories_from_config(CFG)
-TOWER = (42.5, -83.4)
-
-
-def orbit_point(angle_deg, radius_m=40):
-    """Drone position on a circle around the tower; angle 0 = north of it."""
-    a = math.radians(angle_deg)
-    lat = TOWER[0] + radius_m * math.cos(a) / 111_320
-    lon = TOWER[1] + radius_m * math.sin(a) / (111_320 * math.cos(math.radians(TOWER[0])))
-    return lat, lon
-
-
-def to_yaw(deg):  # DJI reports -180..180
-    return (deg + 180) % 360 - 180
-
-
-def shoot_orbit(folder, start, pitch, facing_in, n=12, start_at=0, radius=40):
-    names = []
-    for i in range(n):
-        ang = start_at + i * 360 / n
-        lat, lon = orbit_point(ang, radius)
-        toward = (ang + 180) % 360            # bearing from drone to tower
-        yaw = toward if facing_in else toward + 180
-        names.append(make_dji(folder / f"DJI_{start + i:04}.JPG", pitch, to_yaw(yaw), lat, lon).name)
-    return names
-
-
 def test_meta_is_read(tmp_path):
-    p = make_dji(tmp_path / "a.jpg", "0.00", -123.4, 42.1, -83.2)
+    p = make_dji(tmp_path / "a.jpg", "0.00", -123.4, 42.1, -83.2)  # GPS still read, unused
     m = read_photo_meta(p)
     assert (m.pitch, m.yaw, m.lat, m.lon) == (0.0, -123.4, 42.1, -83.2)
 
@@ -51,34 +23,71 @@ def test_longtitude_misspelling(tmp_path):
     assert read_photo_meta(p).lon == -2.5
 
 
-def test_center_in_and_out_split(tmp_path):
+def to_dji(deg):
+    return (deg + 180) % 360 - 180
+
+
+def orbit_yaws(start, n, jitter=0):
+    """A full orbit: start near ``start`` and come back around to it."""
+    import random
+    rnd = random.Random(n + start)
+    return [to_dji(start + i * 360 / n + rnd.uniform(-jitter, jitter)) for i in range(n + 1)]
+
+
+def shoot(folder, yaws, pitch="0.00", first=1):
+    return [make_dji(folder / f"DJI_{first + i:04}.JPG", pitch, y).name for i, y in enumerate(yaws)]
+
+
+def sort_names(folder):
+    return {r.source.name: r for r in sort_photos([folder], CATS, dry_run=True, **KW)}
+
+
+def test_two_orbits_split_at_the_flip(tmp_path):
     f = tmp_path / "002"
-    ins = shoot_orbit(f, 1, "0.00", facing_in=True, start_at=0)      # starts north
-    outs = shoot_orbit(f, 100, "0.00", facing_in=False, start_at=180, radius=25)  # starts south
-    res = {r.source.name: r for r in sort_photos([f], CATS, dry_run=True, **KW)}
+    ins = shoot(f, orbit_yaws(0, 16, jitter=12))                 # ~north, around to ~north
+    outs = shoot(f, orbit_yaws(180, 16, jitter=12), first=100)   # flips to ~south, around
+    res = sort_names(f)
+    assert [res[n].category for n in ins] == ["Center In"] * len(ins)
+    assert [res[n].category for n in outs] == ["Center Out"] * len(outs)
+    assert res[outs[0]].rule.startswith("second orbit")
+
+
+def test_starting_directions_are_not_hard_limits(tmp_path):
+    f = tmp_path / "003"
+    ins = shoot(f, orbit_yaws(25, 10, jitter=10))    # started a bit east of north
+    outs = shoot(f, orbit_yaws(230, 10, jitter=10), first=50)
+    res = sort_names(f)
     assert all(res[n].category == "Center In" for n in ins)
     assert all(res[n].category == "Center Out" for n in outs)
-    assert res[outs[0]].rule == "camera faces away from tower"
 
 
-def test_works_with_only_part_of_an_orbit_and_other_shots(tmp_path):
-    f = tmp_path / "003"
-    shoot_orbit(f, 1, "-40.00", facing_in=True, n=8)                 # tower flight around it
-    outs = shoot_orbit(f, 50, "0.00", facing_in=False, n=3, start_at=90)  # only 3 out shots
-    res = {r.source.name: r for r in sort_photos([f], CATS, dry_run=True, **KW)}
-    assert all(res[n].category == "Center Out" for n in outs)
-
-
-def test_no_gps_stays_center_in(tmp_path):
+def test_coarse_orbit_steps_are_not_mistaken_for_the_flip(tmp_path):
     f = tmp_path / "004"
+    ins = shoot(f, orbit_yaws(0, 4))          # 90 degree steps, only one orbit
+    res = sort_names(f)
+    assert all(res[n].category == "Center In" for n in ins)
+
+
+def test_other_angles_in_between_dont_matter(tmp_path):
+    f = tmp_path / "005"
+    shoot(f, orbit_yaws(0, 8), first=1)
+    shoot(f, [10, 120, -100], pitch="-40.00", first=20)   # tower flight shots
+    outs = shoot(f, orbit_yaws(180, 8), first=40)
+    res = sort_names(f)
+    assert all(res[n].category == "Center Out" for n in outs)
+    assert res["DJI_0020.JPG"].category == "Tower Flight"
+
+
+def test_no_direction_data_stays_center_in(tmp_path):
+    f = tmp_path / "006"
     make_dji(f / "DJI_0001.JPG", "0.00")
-    res = sort_photos([f], CATS, dry_run=True, **KW)
-    assert res[0].category == "Center In"
+    make_dji(f / "DJI_0002.JPG", "0.00")
+    assert {r.category for r in sort_photos([f], CATS, dry_run=True, **KW)} == {"Center In"}
 
 
 def test_access_road_created_and_never_sorted(tmp_path):
     f = tmp_path / "005"
-    shoot_orbit(f, 1, "0.00", facing_in=True, n=4)
+    shoot(f, orbit_yaws(0, 4))
     sub = f / "Battery 2"
     make_dji(sub / "DJI_0100.JPG", "-90.00")
     sort_photos([f], CATS, **KW)
