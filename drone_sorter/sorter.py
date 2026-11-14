@@ -14,7 +14,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Iterable
 
-from .pitch_reader import read_gimbal_pitch
+import math
+
+from .pitch_reader import PhotoMeta, read_photo_meta
 
 UNSORTED = "UNSORTED"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".dng"}
@@ -40,6 +42,13 @@ DEFAULT_CONFIG = {
     ],
     # Safety limit: a gap with more photos than this is left alone.
     "max_photos_between": 15,
+    # Photos in "category" whose camera faces AWAY from the tower go to "away_category".
+    # The tower position is the average GPS position of all photos in the folder.
+    "facing_rules": [
+        {"category": "Center In", "away_category": "Center Out"},
+    ],
+    # Empty folders created in every sorted folder (e.g. for GoPro photos).
+    "extra_folders": ["Access Road"],
 }
 
 
@@ -160,6 +169,62 @@ def apply_sequence_rules(
             for k in range(i + 1, j):
                 cats[k] = rule.category
                 reasons[k] = rule.label()
+    return cats, reasons
+
+
+def facing_rules_from_config(cfg: dict) -> list[tuple[str, str]]:
+    raw = cfg.get("facing_rules", DEFAULT_CONFIG["facing_rules"])
+    return [(str(r["category"]).strip(), str(r["away_category"]).strip()) for r in raw]
+
+
+def extra_folders_from_config(cfg: dict) -> list[str]:
+    raw = cfg.get("extra_folders", DEFAULT_CONFIG["extra_folders"])
+    return [str(n).strip() for n in raw if str(n).strip()]
+
+
+MIN_DISTANCE_M = 8.0  # closer than this to the tower, "facing toward" is meaningless
+
+
+def _bearing_and_distance(lat1, lon1, lat2, lon2) -> tuple[float, float]:
+    """Compass bearing (degrees) and distance (metres) from point 1 to point 2."""
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    x = math.sin(dlon) * math.cos(p2)
+    y = math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dlon)
+    bearing = (math.degrees(math.atan2(x, y)) + 360) % 360
+    dy = (lat2 - lat1) * 111_320
+    dx = (lon2 - lon1) * 111_320 * math.cos(math.radians((lat1 + lat2) / 2))
+    return bearing, math.hypot(dx, dy)
+
+
+def apply_facing_rules(
+    metas: list[PhotoMeta], categories: list[str], rules: Iterable[tuple[str, str]]
+) -> tuple[list[str], list[str]]:
+    """Split e.g. Center In / Center Out by whether the camera faces the tower.
+
+    ``metas``/``categories`` are for ONE folder. The tower is taken to be the
+    average GPS position of every photo in the folder that has one. Photos
+    without GPS or camera direction, or right above the tower, are unchanged.
+    """
+    cats = list(categories)
+    reasons = [""] * len(cats)
+    rules = list(rules)
+    located = [m for m in metas if m.lat is not None and m.lon is not None]
+    if not rules or len(located) < 3:
+        return cats, reasons
+    c_lat = sum(m.lat for m in located) / len(located)
+    c_lon = sum(m.lon for m in located) / len(located)
+    for k, m in enumerate(metas):
+        for cat, away in rules:
+            if cats[k] != cat or m.yaw is None or m.lat is None or m.lon is None:
+                continue
+            bearing, dist = _bearing_and_distance(m.lat, m.lon, c_lat, c_lon)
+            if dist < MIN_DISTANCE_M:
+                continue
+            off = abs((m.yaw - bearing + 180) % 360 - 180)  # 0 = facing tower
+            if off > 90:
+                cats[k] = away
+                reasons[k] = "camera faces away from tower"
     return cats, reasons
 
 
@@ -409,13 +474,16 @@ def sort_photos(
     workers: int = 8,
     write_log: bool = True,
     rules: list[SequenceRule] | None = None,
+    facing_rules: list[tuple[str, str]] | None = None,
+    extra_folders: list[str] | None = None,
 ) -> list[FileResult]:
     """Sort every photo under ``sources``. Pitch reading runs in parallel;
     file placement is sequential so name-collision handling stays safe.
 
     Unless ``dry_run``, a "Sort log <date>.csv" is written into each source
     folder recording where every photo went (see ``undo_sort_log``)."""
-    output_names = {c.name for c in categories} | {UNSORTED}
+    output_names = ({c.name for c in categories} | {UNSORTED}
+                    | {away for _, away in (facing_rules or [])} | set(extra_folders or []))
     jobs: list[tuple[Path, Path]] = []
     seen: set[Path] = set()
     for root in sources:
@@ -428,14 +496,14 @@ def sort_photos(
     results: list[FileResult] = []
     log = SortLog(datetime.now()) if (write_log and not dry_run) else None
 
-    def read(job: tuple[Path, Path]) -> tuple[float | None, str]:
+    def read(job: tuple[Path, Path]) -> tuple[PhotoMeta, str]:
         try:
-            return read_gimbal_pitch(job[1]), ""
+            return read_photo_meta(job[1]), ""
         except OSError as e:
-            return None, str(e)
+            return PhotoMeta(), str(e)
 
     # Pass 1: read every pitch (fast, parallel).
-    readings: list[tuple[float | None, str]] = []
+    readings: list[tuple[PhotoMeta, str]] = []
     with ThreadPoolExecutor(max_workers=workers) as pool:
         for r in pool.map(read, jobs):
             if cancel is not None and cancel.is_set():
@@ -444,23 +512,36 @@ def sort_photos(
             readings.append(r)
 
     # Pass 2: decide categories, folder by folder, in shooting (file-name) order.
-    cats = [assign_category(p, categories) for p, _ in readings]
+    cats = [assign_category(m.pitch, categories) for m, _ in readings]
     reasons = [""] * total
-    if rules:
-        by_folder: dict[Path, list[int]] = {}
-        for idx, (_, img) in enumerate(jobs):
-            by_folder.setdefault(img.parent, []).append(idx)
-        for idxs in by_folder.values():
-            idxs.sort(key=lambda k: jobs[k][1].name.lower())
-            new_cats, new_reasons = apply_sequence_rules(
-                [readings[k][0] for k in idxs], [cats[k] for k in idxs], rules)
+    by_folder: dict[Path, list[int]] = {}
+    for idx, (_, img) in enumerate(jobs):
+        by_folder.setdefault(img.parent, []).append(idx)
+    for idxs in by_folder.values():
+        idxs.sort(key=lambda k: jobs[k][1].name.lower())
+        for step in ("facing", "sequence"):
+            if step == "facing" and facing_rules:
+                new_cats, new_reasons = apply_facing_rules(
+                    [readings[k][0] for k in idxs], [cats[k] for k in idxs], facing_rules)
+            elif step == "sequence" and rules:
+                new_cats, new_reasons = apply_sequence_rules(
+                    [readings[k][0].pitch for k in idxs], [cats[k] for k in idxs], rules)
+            else:
+                continue
             for k, c, why in zip(idxs, new_cats, new_reasons):
-                cats[k], reasons[k] = c, why
+                if why:
+                    cats[k], reasons[k] = c, why
+
+    if extra_folders and not dry_run:
+        for folder in by_folder:
+            for name in extra_folders:
+                (folder / name).mkdir(exist_ok=True)
 
     # Pass 3: place files (sequential, so name-collision handling stays safe).
     try:
-        for i, ((root, img), (pitch, read_err), category, why) in enumerate(
+        for i, ((root, img), (meta, read_err), category, why) in enumerate(
                 zip(jobs, readings, cats, reasons), 1):
+            pitch = meta.pitch
             if cancel is not None and cancel.is_set():
                 break
             try:
@@ -493,7 +574,9 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = load_config(args.config)
     results = sort_photos(args.folders, categories_from_config(cfg), move=args.move,
-                          dry_run=args.dry_run, rules=rules_from_config(cfg))
+                          dry_run=args.dry_run, rules=rules_from_config(cfg),
+                          facing_rules=facing_rules_from_config(cfg),
+                          extra_folders=extra_folders_from_config(cfg))
     for r in results:
         pitch = f"{r.pitch:.1f}" if r.pitch is not None else "N/A"
         print(f"{r.action:8} {pitch:>7}  {r.source} -> {r.category}/")

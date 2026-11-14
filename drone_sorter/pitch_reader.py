@@ -12,6 +12,7 @@ No ExifTool or other external program is needed.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 # Matches both XMP serialisations:
@@ -23,7 +24,32 @@ _PITCH_RE = re.compile(
 
 FIRST_CHUNK = 256 * 1024     # covers the XMP packet of every DJI JPEG
 CHUNK = 1024 * 1024          # follow-up chunk size for DNG / unusual files
-_OVERLAP = 128               # so a tag split across two chunks is still found
+_OVERLAP = 4096             # so tags split across two chunks are still found
+
+
+_NUM = rb"\s*(?:=\s*[\"']|>)\s*([+-]?\d+(?:\.\d+)?)"
+_FIELDS = {
+    "yaw": re.compile(rb"drone-dji:GimbalYawDegree" + _NUM),
+    "lat": re.compile(rb"drone-dji:GpsLatitude" + _NUM),
+    # some DJI firmware spells it "Longtitude"
+    "lon": re.compile(rb"drone-dji:GpsLongt?itude" + _NUM),
+}
+
+
+@dataclass(frozen=True)
+class PhotoMeta:
+    pitch: float | None = None
+    yaw: float | None = None     # compass direction the camera faces (0 = north)
+    lat: float | None = None
+    lon: float | None = None
+
+
+def _parse_meta(data: bytes, pitch: float) -> PhotoMeta:
+    vals = {}
+    for key, rx in _FIELDS.items():
+        m = rx.search(data)
+        vals[key] = float(m.group(1)) if m else None
+    return PhotoMeta(pitch, **vals)
 
 
 def parse_pitch(data: bytes) -> float | None:
@@ -32,24 +58,27 @@ def parse_pitch(data: bytes) -> float | None:
     return float(m.group(1)) if m else None
 
 
-def read_gimbal_pitch(path: str | Path, full_scan: bool = True) -> float | None:
-    """Return the gimbal pitch (degrees) of a DJI photo, or None if absent.
-
-    Reads only the first 256 KB in the common case. If the tag isn't there and
-    ``full_scan`` is True, keeps scanning the rest of the file in 1 MB chunks.
-    """
+def read_photo_meta(path: str | Path, full_scan: bool = True) -> PhotoMeta:
+    """Gimbal pitch plus camera direction and GPS, from the photo's DJI XMP."""
     with open(path, "rb") as f:
         buf = f.read(FIRST_CHUNK)
         pitch = parse_pitch(buf)
-        if pitch is not None or not full_scan:
-            return pitch
+        if pitch is not None:
+            return _parse_meta(buf, pitch)
+        if not full_scan:
+            return PhotoMeta()
         tail = buf[-_OVERLAP:]
         while True:
             chunk = f.read(CHUNK)
             if not chunk:
-                return None
+                return PhotoMeta()
             buf = tail + chunk
             pitch = parse_pitch(buf)
             if pitch is not None:
-                return pitch
+                return _parse_meta(buf, pitch)
             tail = buf[-_OVERLAP:]
+
+
+def read_gimbal_pitch(path: str | Path, full_scan: bool = True) -> float | None:
+    """Return the gimbal pitch (degrees) of a DJI photo, or None if absent."""
+    return read_photo_meta(path, full_scan).pitch

@@ -70,6 +70,25 @@ in a different folder. As a safety limit, a gap of more than 15 photos is left a
 In the Activity tab, these photos are marked "shot order". Turn the **Use shot order**
 switch off to sort by angle only.
 
+## Center In vs Center Out
+
+Both orbits are shot at 0°, so the angle alone can't tell them apart. The app uses the
+camera direction and GPS position that DJI saves in every photo:
+
+1. It finds the tower by averaging the GPS positions of all photos in the folder.
+2. For each 0° photo, it checks whether the camera was pointing toward that spot
+   (**Center In**) or away from it (**Center Out**). Anything within 90° of the
+   tower's direction counts as "toward".
+
+The order and starting direction of the orbits don't matter. Photos without GPS stay
+in Center In.
+
+## Access Road folder
+
+Every sorted folder also gets an empty **Access Road** folder for your GoPro photos.
+Anything you put in it is never touched by later sorts. Change or add folder names
+under `"extra_folders"` in `categories.json`.
+
 ## Editing categories
 
 `categories.json`:
