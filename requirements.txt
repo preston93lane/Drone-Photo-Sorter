@@ -4,3 +4,5 @@ sv-ttk>=2.6
 darkdetect>=0.8
 # Drag & drop of folders onto the window
 tkinterdnd2>=0.4
+# Checks pixels are identical when shrinking for upload
+Pillow>=10

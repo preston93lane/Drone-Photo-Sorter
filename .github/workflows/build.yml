@@ -18,7 +18,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pytest
+      - run: pip install pytest Pillow && sudo apt-get install -y -q libjpeg-turbo-progs
       - run: pytest -q
 
   build-windows:
@@ -43,12 +43,36 @@ jobs:
           else
             echo "new=true" >> "$GITHUB_OUTPUT"
           fi
+      - name: Get jpegtran (lossless JPG shrinking) from libjpeg-turbo
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ASSET=$(gh release view --repo libjpeg-turbo/libjpeg-turbo --json assets \
+                    --jq '.assets[].name' | grep -E '^libjpeg-turbo-.*-vc(-x)?64\.exe$' | head -1)
+          echo "Using $ASSET"
+          gh release download --repo libjpeg-turbo/libjpeg-turbo --pattern "$ASSET" --dir dl
+          7z x "dl/$ASSET" -odl/ljt >/dev/null
+          mkdir -p vendor/jpegtran
+          cp "$(find dl/ljt -iname jpegtran.exe | head -1)" vendor/jpegtran/
+          find dl/ljt -ipath '*bin*' -iname '*.dll' -exec cp {} vendor/jpegtran/ \;
+          ls -la vendor/jpegtran
+          vendor/jpegtran/jpegtran.exe -version
+      - name: Test shrinking on Windows
+        shell: bash
+        run: |
+          pip install pytest
+          export DRONE_SORTER_JPEGTRAN="$(cygpath -w "$PWD/vendor/jpegtran/jpegtran.exe")"
+          python -c "from drone_sorter import shrink; assert shrink.is_available(), 'jpegtran not found'"
+          pytest -q tests/test_shrink.py
       - name: Build single-file exe
         run: >
           pyinstaller --noconfirm --onefile --windowed
           --name DronePitchSorter
           --collect-all tkinterdnd2
           --collect-all sv_ttk
+          --add-binary "vendor/jpegtran/*;jpegtran"
           main.py
       - uses: actions/upload-artifact@v4
         with:

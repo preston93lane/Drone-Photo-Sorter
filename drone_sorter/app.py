@@ -13,7 +13,7 @@ from collections import Counter
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, updater
+from . import __version__, shrink, updater
 from .sorter import (
     UNSORTED,
     categories_from_config,
@@ -80,6 +80,8 @@ class DroneSorterApp:
         self.mode = tk.StringVar(value="copy")
         self.preview = tk.BooleanVar(value=False)
         self.use_order = tk.BooleanVar(value=True)
+        self.shrink_on = tk.BooleanVar(value=False)
+        self.shrink_start = 0.0
         self.rules = []
         self.facing = []
         self.extra = []
@@ -94,6 +96,7 @@ class DroneSorterApp:
         self._apply_theme(darkdetect.theme().lower() if darkdetect and darkdetect.theme() else "light")
         self._build()
         self.mode.trace_add("write", lambda *_: self._refresh_mode())
+        self.shrink_on.trace_add("write", lambda *_: self._refresh_mode())
         self.preview.trace_add("write", lambda *_: self._refresh_start_button())
         self._refresh_mode()
         self._refresh_start_button()
@@ -206,10 +209,15 @@ class DroneSorterApp:
         self.sw_order = ttk.Checkbutton(row, text="Use shot order", variable=self.use_order,
                                         style="Switch.TCheckbutton")
         self.sw_order.pack(side=tk.LEFT, padx=(18, 0))
+        self.sw_shrink = ttk.Checkbutton(row, text="Shrink for upload", variable=self.shrink_on,
+                                         style="Switch.TCheckbutton")
+        self.sw_shrink.pack(side=tk.LEFT, padx=(18, 0))
         row2 = ttk.Frame(card2)
         row2.pack(fill=tk.X, pady=(12, 0))
         self.btn_config = ttk.Button(row2, text="Edit angles & rules…", command=self._open_config)
         self.btn_config.pack(side=tk.RIGHT)
+        self.btn_estimate = ttk.Button(row2, text="Estimate savings", command=self._estimate)
+        self.btn_estimate.pack(side=tk.RIGHT, padx=(0, 8))
         tol = ttk.Frame(row2)
         tol.pack(side=tk.LEFT)
         ttk.Label(tol, text="Angle tolerance ±").pack(side=tk.LEFT)
@@ -276,6 +284,27 @@ class DroneSorterApp:
         f = ttk.Frame(parent)
         f.pack(fill=tk.X, pady=(20, 8))
         ttk.Label(f, text=f"{num}   {text}", style="Step.TLabel").pack(side=tk.LEFT)
+
+    # ------------------------------------------------------------ shrink ---
+    def _estimate(self):
+        if not self.source_dirs or self._busy():
+            if not self.source_dirs:
+                messagebox.showinfo("Estimate savings", "Add a flight folder first.")
+            return
+        cats = self._categories() or []
+        names = {c.name for c in cats} | {UNSORTED}
+        dirs = list(self.source_dirs)
+        self._set_running(True)
+        self.btn_cancel.state(["disabled"])
+        self.lbl_status.config(text="Trying 20 photos to estimate the savings…")
+        def work():
+            try:
+                photos = find_images(dirs, names)
+                self.events.put(("estimate", *shrink.estimate_savings(photos)))
+            except Exception as e:
+                self.events.put(("fatal", e))
+        self.worker = threading.Thread(target=work, daemon=True)
+        self.worker.start()
 
     # ------------------------------------------------------------ update ---
     def _start_update_check(self):
@@ -406,7 +435,12 @@ class DroneSorterApp:
         return self.worker is not None and self.worker.is_alive()
 
     def _refresh_mode(self):
-        self.lbl_mode.config(text=MODE_HELP[self.mode.get()])
+        text = MODE_HELP[self.mode.get()]
+        if self.shrink_on.get():
+            text += ("\n\nShrink for upload: after sorting, each sorted photo is repacked to be "
+                     "smaller with exactly the same pixels and DJI data. Every photo is checked "
+                     "pixel by pixel before it's replaced. Typically 5–10% smaller.")
+        self.lbl_mode.config(text=text)
         self._refresh_start_button()
 
     def _refresh_start_button(self):
@@ -421,9 +455,14 @@ class DroneSorterApp:
 
     def _set_running(self, running: bool):
         for w in (self.btn_start, self.btn_browse, self.btn_clear, self.btn_config, self.btn_undo,
-                  self.rb_copy, self.rb_move, self.sw_preview, self.sw_order, self.spin_tol):
+                  self.rb_copy, self.rb_move, self.sw_preview, self.sw_order, self.sw_shrink,
+                  self.btn_estimate, self.spin_tol):
             w.state(["disabled"] if running else ["!disabled"])
         self.btn_cancel.state(["!disabled"] if running else ["disabled"])
+        if not shrink.is_available():
+            self.sw_shrink.state(["disabled"])
+            self.btn_estimate.state(["disabled"])
+            self.sw_shrink.config(text="Shrink for upload (not available)")
         if not running:
             self._refresh_start_button()
 
@@ -469,6 +508,7 @@ class DroneSorterApp:
         self.lbl_status.config(text="Starting…")
         verb = "Previewing" if dry else ("Moving" if move else "Copying")
         self._log("", (f"— {verb} photos —", "muted"))
+        do_shrink = self.shrink_on.get() and shrink.is_available()
 
         def work():
             try:
@@ -478,7 +518,16 @@ class DroneSorterApp:
                     on_progress=lambda i, n, r: self.events.put(("progress", i, n, r)),
                     cancel=self.cancel_event,
                 )
-                self.events.put(("done", results, dry, move))
+                shrunk = []
+                if do_shrink and not dry and not self.cancel_event.is_set():
+                    targets = [r.dest for r in results if r.action in ("moved", "copied") and r.dest]
+                    self.events.put(("shrink_start", len(targets)))
+                    saved = [0]
+                    def prog(i, n, res):
+                        saved[0] += res.saved
+                        self.events.put(("shrink_progress", i, n, saved[0], res))
+                    shrunk = shrink.shrink_files(targets, on_progress=prog, cancel=self.cancel_event)
+                self.events.put(("done", results, dry, move, shrunk))
             except Exception as e:
                 self.events.put(("fatal", e))
 
@@ -548,6 +597,30 @@ class DroneSorterApp:
                         text="No photos found in these folders (already sorted?)" if n == 0
                         else f"{n:,} photos ready to sort" if n else " ")
                 self._refresh_start_button()
+        elif kind == "shrink_start":
+            self.shrink_start = time.monotonic()
+            self.progress["value"] = 0
+            self._log(("— Shrinking for upload —", "muted"))
+            self.lbl_status.config(text=f"Shrinking {ev[1]:,} photos…")
+        elif kind == "shrink_progress":
+            _, i, n, saved, res = ev
+            self.progress["value"] = i / n * 100 if n else 100
+            el = time.monotonic() - self.shrink_start
+            eta = ""
+            if el > 1 and i:
+                left = int((n - i) / (i / el))
+                m, sec = divmod(left, 60)
+                eta = f"  ·  about {f'{m}m {sec}s' if m else f'{sec}s'} left"
+            self.lbl_status.config(text=f"Shrinking {i:,} of {n:,}  ·  {_gb(saved)} saved{eta}")
+            if res.status == "error":
+                self._log((f"not shrunk  {res.path.name}: {res.error} (original kept)", "warn"))
+        elif kind == "estimate":
+            self._set_running(False)
+            _, frac, total, saved = ev
+            msg = (f"Shrink for upload would make these photos about {frac:.0%} smaller: "
+                   f"{_gb(total)} → {_gb(total - saved)} (saves about {_gb(saved)}).")
+            self.lbl_status.config(text=msg)
+            self._log((msg, "ok"))
         elif kind == "done":
             self._finish(*ev[1:])
         elif kind == "undone":
@@ -607,7 +680,7 @@ class DroneSorterApp:
             text += f"  ·  {rate:,.0f} photos/s  ·  about {f'{mins}m {secs}s' if mins else f'{secs}s'} left"
         self.lbl_status.config(text=text)
 
-    def _finish(self, results, dry, move):
+    def _finish(self, results, dry, move, shrunk=()):
         self._set_running(False)
         cancelled = self.cancel_event.is_set()
         if not results:
@@ -629,12 +702,21 @@ class DroneSorterApp:
         summary = f"{head}: {', '.join(parts)} in {elapsed:.1f}s"
         if move and not dry and by_action.get("moved"):
             summary += "  ·  sort log saved in each folder"
+        if shrunk:
+            before = sum(r.before for r in shrunk)
+            saved = sum(r.saved for r in shrunk)
+            pct = f" ({saved / before:.0%})" if before else ""
+            summary += f"  ·  shrunk by {_gb(saved)}{pct}"
         self.lbl_status.config(text=summary)
         self._log((summary, "err" if by_action.get("error") else "ok"))
         if not cancelled:
             self.progress["value"] = 100
         if not dry:
             self._count_photos(show_status=False)
+
+
+def _gb(n: int) -> str:
+    return f"{n / 1e9:.2f} GB" if n >= 1e8 else f"{n / 1e6:.1f} MB"
 
 
 def _enable_crisp_text_on_windows():

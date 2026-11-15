@@ -42,6 +42,21 @@ Running it again on the same folder is safe. It ignores its own output folders a
 skips photos that are already sorted. If a *different* file with the same name is
 already there, the new one is saved as `name_1.JPG` instead of overwriting it.
 
+## Shrink for upload
+
+An optional switch (off by default). After sorting, each sorted photo is repacked to be
+smaller, typically 5–10%, with **exactly the same pixels** and all DJI data kept. It
+rebuilds the JPG's internal compression tables (optimized, progressive) using
+`jpegtran` from libjpeg-turbo, which is built into the app. The image itself isn't
+re-compressed.
+
+Every shrunk photo is decoded and compared pixel by pixel with the original, and its
+DJI data is re-read, before it replaces the original. If any check fails, the original
+is kept. In Copy mode only the sorted copies are shrunk; originals stay untouched.
+
+**Estimate savings** tries 20 photos from the selected folders without changing anything
+and shows how much space the whole set would save.
+
 ## Is Move safe?
 
 Yes. Move is built so that a photo can't be lost:
