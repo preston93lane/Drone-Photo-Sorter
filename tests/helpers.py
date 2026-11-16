@@ -26,9 +26,15 @@ def make_jpg(path: Path, pitch, element_form=False, payload=b"img", padding=0):
     return path
 
 
-def make_dji(path: Path, pitch, yaw=None, lat=None, lon=None, payload=b"img"):
-    """Fake DJI photo with gimbal pitch, camera direction and GPS."""
+def make_dji(path: Path, pitch, yaw=None, lat=None, lon=None, payload=b"img", taken=None):
+    """Fake DJI photo with gimbal pitch, camera direction, GPS and capture time
+    (``taken`` = seconds after 2026-11-14 10:00:00, written as xmp:CreateDate)."""
     attrs = [f'drone-dji:GimbalPitchDegree="{pitch}"']
+    if taken is not None:
+        from datetime import datetime, timedelta
+        t = datetime(2026, 11, 14, 10) + timedelta(seconds=taken)
+        frac = f"{t.microsecond / 1e6:.2f}"[1:] if t.microsecond else ""
+        attrs.append(f'xmp:CreateDate="{t:%Y-%m-%dT%H:%M:%S}{frac}"')
     if yaw is not None:
         attrs.append(f'drone-dji:GimbalYawDegree="{yaw:+.2f}"')
     if lat is not None:

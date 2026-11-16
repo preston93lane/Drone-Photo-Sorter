@@ -111,6 +111,28 @@ Both orbits are shot at 0°, so the app uses your shot pattern instead:
 The jump only has to be more than 120°, so imperfect numbers are fine. If there's no
 big jump (only one orbit), everything stays in Center In. GPS isn't used.
 
+## Rooftop sectors
+
+On rooftops each sector is shot as a group: **Downlook (−35°) → Center In and Center Out
+(0°) → Uplook (+20°, sometimes skipped)**, then the next sector.
+
+- A new sector starts at a −35° photo when 0° photos have been taken since the
+  previous −35° photo. With 2 or more sectors, each sector's downlooks go to their own
+  folder: **Sector 1**, **Sector 2**, … With only one (a normal tower site), they stay in
+  **Downlook**.
+- All center ins, center outs and uplooks still go to **Center In**, **Center Out** and
+  **Uplook**.
+- **Center In vs Center Out is decided per sector.** On rooftops the camera keeps turning
+  smoothly from the in arc into the out arc, so the app looks for the **pause** while you
+  move the drone in front of the antennas: the biggest gap in capture time, if it's at
+  least 3 seconds and 3× the normal gap between photos. With the 0.7 s interval timer,
+  **wait about 5 seconds** before restarting, because photo times are often stored to the
+  whole second. Tower orbits still use the ~180° direction flip.
+- If a sector has neither a flip nor a clear pause, its 0° photos stay in Center In and
+  the Activity tab flags it in yellow.
+
+This follows the **Use shot order** switch.
+
 ## Access Road folder
 
 Every sorted folder also gets an empty **Access Road** folder for your GoPro photos.

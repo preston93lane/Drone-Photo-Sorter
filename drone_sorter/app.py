@@ -20,6 +20,8 @@ from .sorter import (
     rules_from_config,
     facing_rules_from_config,
     extra_folders_from_config,
+    sector_folder_names,
+    sector_rule_from_config,
     ensure_config_file,
     find_images,
     load_config,
@@ -85,6 +87,8 @@ class DroneSorterApp:
         self.rules = []
         self.facing = []
         self.extra = []
+        self.sector = None
+        self.pause = (3.0, 3.0)
         self.tolerance = tk.StringVar()
 
         try:
@@ -398,7 +402,8 @@ class DroneSorterApp:
         cats = self._categories(silent=True) or []
         try:
             cfg = load_config(self.config_file)
-            extra = {away for _, away in facing_rules_from_config(cfg)} | set(extra_folders_from_config(cfg))
+            extra = ({away for _, away in facing_rules_from_config(cfg)} | set(extra_folders_from_config(cfg))
+                     | sector_folder_names(sector_rule_from_config(cfg)))
         except (ValueError, KeyError, TypeError):
             extra = set()
         names = {c.name for c in cats} | {UNSORTED} | extra
@@ -475,6 +480,8 @@ class DroneSorterApp:
             self.rules = rules_from_config(cfg, tol) if self.use_order.get() else []
             self.facing = facing_rules_from_config(cfg)
             self.extra = extra_folders_from_config(cfg)
+            self.sector = sector_rule_from_config(cfg) if self.use_order.get() else None
+            self.pause = (float(cfg.get("pause_seconds", 3.0)), float(cfg.get("pause_factor", 3.0)))
         except (ValueError, KeyError, TypeError) as e:
             if not silent:
                 messagebox.showerror("Settings", f"The tolerance or categories.json isn't valid:\n\n{e}")
@@ -514,7 +521,8 @@ class DroneSorterApp:
             try:
                 results = sort_photos(
                     self.source_dirs, categories, move=move, dry_run=dry, rules=self.rules,
-                    facing_rules=self.facing, extra_folders=self.extra,
+                    facing_rules=self.facing, extra_folders=self.extra, sector_rule=self.sector,
+                    pause_seconds=self.pause[0], pause_factor=self.pause[1],
                     on_progress=lambda i, n, r: self.events.put(("progress", i, n, r)),
                     cancel=self.cancel_event,
                 )
@@ -664,7 +672,10 @@ class DroneSorterApp:
             return (f"error     {name}: {r.error}", "err")
         renamed = f"  (saved as {r.dest.name})" if r.dest and r.dest.name != r.source.name else ""
         tag = "warn" if r.category == UNSORTED or r.action == "skipped" else None
-        why = f"  ({r.rule})" if r.rule.startswith("second orbit") else (f"  (shot order: {r.rule})" if r.rule else "")
+        why = (f"  (shot order: {r.rule})" if r.rule.startswith("between")
+               else f"  ({r.rule})" if r.rule else "")
+        if "no Center Out found" in r.rule:
+            tag = "warn"
         return (f"{r.action:9} {pitch}  {name}  →  {r.category}{renamed}{why}", tag)
 
     def _update_progress(self, i: int, n: int):

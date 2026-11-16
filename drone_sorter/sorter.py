@@ -51,6 +51,13 @@ DEFAULT_CONFIG = {
     ],
     # Empty folders created in every sorted folder (e.g. for GoPro photos).
     "extra_folders": ["Access Road"],
+    # Rooftops: several Downlook sets, each followed by 0-degree photos, are
+    # separate sectors. Each set goes to its own folder ("Sector 1", ...).
+    "sector_rule": {"category": "Downlook", "between": "Center In", "folder": "Sector {n}"},
+    # Center In/Out without a direction flip: split at a pause in shooting
+    # at least this long and this many times the normal gap between photos.
+    "pause_seconds": 3.0,
+    "pause_factor": 3.0,
 }
 
 
@@ -224,32 +231,121 @@ def _turn(a: float, b: float) -> float:
     return abs((b - a + 180) % 360 - 180)
 
 
-def apply_facing_rules(
-    metas: list[PhotoMeta], categories: list[str], rules: Iterable[tuple[str, str]]
-) -> tuple[list[str], list[str]]:
-    """Split one angle set into two orbits by the camera-direction flip.
+MAX_SECTORS = 20
 
-    ``metas``/``categories`` are for ONE folder in shooting order. Among the
-    photos in ``category`` (e.g. Center In), find the biggest jump in camera
-    direction from one photo to the next. During an orbit each step is small;
-    switching from facing in to facing out is a jump of about 180 degrees. If
-    the biggest jump is over 120 degrees, every photo after it goes to
-    ``away_category`` (e.g. Center Out). No GPS is used.
+
+def sector_rule_from_config(cfg: dict) -> dict | None:
+    rule = cfg.get("sector_rule", DEFAULT_CONFIG["sector_rule"])
+    if not rule:
+        return None
+    return {"category": str(rule.get("category", "Downlook")),
+            "between": str(rule.get("between", "Center In")),
+            "folder": str(rule.get("folder", "Sector {n}"))}
+
+
+def sector_folder_names(rule: dict | None) -> set[str]:
+    if not rule:
+        return set()
+    return {rule["folder"].replace("{n}", str(n)) for n in range(1, MAX_SECTORS + 1)}
+
+
+def apply_sector_rule(categories: list[str], rule: dict | None):
+    """Number rooftop sectors in ONE folder (shooting order).
+
+    A new sector starts at a ``category`` photo (Downlook) when at least one
+    ``between`` photo (Center In, i.e. 0 degrees) was taken since the previous
+    Downlook photo. With 2+ sectors, each sector's Downlook photos go to
+    "Sector N". Returns (categories, reasons, segments); ``segments`` is a list
+    of index lists, one per sector, or None when there's only one sector.
     """
     cats = list(categories)
     reasons = [""] * len(cats)
+    if not rule:
+        return cats, reasons, None
+    down, between = rule["category"], rule["between"]
+    starts, seen_between = [], True
+    for k, c in enumerate(cats):
+        if c == down:
+            if seen_between:
+                starts.append(k)
+            seen_between = False
+        elif c == between:
+            seen_between = True
+    if len(starts) < 2:
+        return cats, reasons, None
+    bounds = [0] + starts[1:] + [len(cats)]
+    segments = [list(range(bounds[i], bounds[i + 1])) for i in range(len(bounds) - 1)]
+    for n, seg in enumerate(segments, 1):
+        n = min(n, MAX_SECTORS)
+        for k in seg:
+            if cats[k] == down:
+                cats[k] = rule["folder"].replace("{n}", str(n))
+                reasons[k] = f"rooftop sector {n}"
+    return cats, reasons, segments
+
+
+def _median(xs: list[float]) -> float:
+    xs = sorted(xs)
+    m = len(xs) // 2
+    return xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2
+
+
+def apply_facing_rules(
+    metas: list[PhotoMeta], categories: list[str], rules: Iterable[tuple[str, str]],
+    segments: list[list[int]] | None = None,
+    pause_seconds: float = 3.0, pause_factor: float = 3.0,
+) -> tuple[list[str], list[str]]:
+    """Split Center In / Center Out, separately within each segment.
+
+    ``metas``/``categories`` are for ONE folder in shooting order; ``segments``
+    are rooftop sectors (None = the whole folder, e.g. a tower site).
+    For the ``category`` photos (Center In) in each segment:
+      1. Direction flip: the biggest change in camera direction between two
+         consecutive photos is over 120 degrees (tower orbits).
+      2. Otherwise, a pause: the biggest gap in capture time is at least
+         ``pause_seconds`` and ``pause_factor`` x the typical gap (rooftops,
+         where the direction keeps turning smoothly but shooting stops while
+         the drone moves in front of the antennas).
+    Photos after the split go to ``away_category`` (Center Out).
+    """
+    cats = list(categories)
+    reasons = [""] * len(cats)
+    rooftop = segments is not None
+    segs = segments if rooftop else [list(range(len(cats)))]
     for cat, away in rules:
-        idxs = [k for k, c in enumerate(cats) if c == cat and metas[k].yaw is not None]
-        if len(idxs) < 2:
-            continue
-        jumps = [(_turn(metas[a].yaw, metas[b].yaw), pos)
-                 for pos, (a, b) in enumerate(zip(idxs, idxs[1:]), 1)]
-        biggest, split = max(jumps)
-        if biggest < MIN_FLIP_DEGREES:
-            continue
-        for k in idxs[split:]:
-            cats[k] = away
-            reasons[k] = f"second orbit (camera direction flipped {biggest:.0f}°)"
+        for n, seg in enumerate(segs, 1):
+            idxs = [k for k in seg if cats[k] == cat]
+            where = f"sector {n}: " if rooftop else ""
+            split_at, why = None, ""
+
+            with_yaw = [k for k in idxs if metas[k].yaw is not None]
+            if len(with_yaw) >= 2:
+                biggest, pos = max((_turn(metas[a].yaw, metas[b].yaw), i)
+                                   for i, (a, b) in enumerate(zip(with_yaw, with_yaw[1:]), 1))
+                if biggest >= MIN_FLIP_DEGREES:
+                    split_at = with_yaw[pos]
+                    why = f"{where}second orbit (camera direction flipped {biggest:.0f}°)"
+
+            if split_at is None:
+                timed = [k for k in idxs if metas[k].taken is not None]
+                if len(timed) >= 3:
+                    gaps = [(metas[b].taken - metas[a].taken, i)
+                            for i, (a, b) in enumerate(zip(timed, timed[1:]), 1)]
+                    typical = _median([g for g, _ in gaps])
+                    biggest, pos = max(gaps)
+                    if biggest >= pause_seconds and biggest >= pause_factor * max(typical, 0.1):
+                        split_at = timed[pos]
+                        why = f"{where}second orbit (after a {biggest:.0f}s pause)"
+
+            if split_at is None:
+                if rooftop and idxs:
+                    for k in idxs:
+                        reasons[k] = f"{where}no Center Out found (no direction flip or pause)"
+                continue
+            for k in idxs:
+                if k >= split_at:
+                    cats[k] = away
+                    reasons[k] = why
     return cats, reasons
 
 
@@ -503,6 +599,9 @@ def sort_photos(
     rules: list[SequenceRule] | None = None,
     facing_rules: list[tuple[str, str]] | None = None,
     extra_folders: list[str] | None = None,
+    sector_rule: dict | None = None,
+    pause_seconds: float = 3.0,
+    pause_factor: float = 3.0,
 ) -> list[FileResult]:
     """Sort every photo under ``sources``. Pitch reading runs in parallel;
     file placement is sequential so name-collision handling stays safe.
@@ -510,7 +609,9 @@ def sort_photos(
     Unless ``dry_run``, a "Sort log <date>.csv" is written into each source
     folder recording where every photo went (see ``undo_sort_log``)."""
     output_names = ({c.name for c in categories} | {UNSORTED}
-                    | {away for _, away in (facing_rules or [])} | set(extra_folders or []))
+                    | {away for _, away in (facing_rules or [])} | set(extra_folders or [])
+                    # always skip sector folders on re-runs, even with the rule switched off
+                    | sector_folder_names(sector_rule or sector_rule_from_config(DEFAULT_CONFIG)))
     jobs: list[tuple[Path, Path]] = []
     seen: set[Path] = set()
     for root in sources:
@@ -546,18 +647,24 @@ def sort_photos(
         by_folder.setdefault(img.parent, []).append(idx)
     for idxs in by_folder.values():
         idxs.sort(key=lambda k: jobs[k][1].name.lower())
-        for step in ("facing", "sequence"):
-            if step == "facing" and facing_rules:
-                new_cats, new_reasons = apply_facing_rules(
-                    [readings[k][0] for k in idxs], [cats[k] for k in idxs], facing_rules)
-            elif step == "sequence" and rules:
-                new_cats, new_reasons = apply_sequence_rules(
-                    [readings[k][0].pitch for k in idxs], [cats[k] for k in idxs], rules)
-            else:
-                continue
+        metas = [readings[k][0] for k in idxs]
+
+        def merge(new_cats, new_reasons):
             for k, c, why in zip(idxs, new_cats, new_reasons):
                 if why:
                     cats[k], reasons[k] = c, why
+
+        # 1) shot-order rules first, so photos in the Compound Flight raise are
+        #    no longer "Downlook" and can't start a false rooftop sector
+        if rules:
+            merge(*apply_sequence_rules([m.pitch for m in metas], [cats[k] for k in idxs], rules))
+        # 2) rooftop sectors
+        new_cats, new_reasons, segments = apply_sector_rule([cats[k] for k in idxs], sector_rule)
+        merge(new_cats, new_reasons)
+        # 3) Center In / Center Out, per sector
+        if facing_rules:
+            merge(*apply_facing_rules(metas, [cats[k] for k in idxs], facing_rules, segments,
+                                      pause_seconds, pause_factor))
 
     if extra_folders and not dry_run:
         for folder in by_folder:
@@ -603,7 +710,10 @@ def main(argv: list[str] | None = None) -> int:
     results = sort_photos(args.folders, categories_from_config(cfg), move=args.move,
                           dry_run=args.dry_run, rules=rules_from_config(cfg),
                           facing_rules=facing_rules_from_config(cfg),
-                          extra_folders=extra_folders_from_config(cfg))
+                          extra_folders=extra_folders_from_config(cfg),
+                          sector_rule=sector_rule_from_config(cfg),
+                          pause_seconds=float(cfg.get("pause_seconds", 3.0)),
+                          pause_factor=float(cfg.get("pause_factor", 3.0)))
     for r in results:
         pitch = f"{r.pitch:.1f}" if r.pitch is not None else "N/A"
         print(f"{r.action:8} {pitch:>7}  {r.source} -> {r.category}/")
