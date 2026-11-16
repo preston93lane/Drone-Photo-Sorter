@@ -76,6 +76,12 @@ Yes. Move is built so that a photo can't be lost:
 These rules are covered by automated tests (`tests/test_move_safety.py`) that simulate
 name clashes, a disk-full error mid-copy, and drives without link support.
 
+## Tower Flight at −40° or −50°
+
+Tower Flight photos can be shot at −40° or, for taller towers, −50°. Both go to
+**Tower Flight**. Photos taken during the Compound Flight raise (between the last −45°
+and the first −20° shot) still go to Compound Flight, whatever their angle.
+
 ## Shot-order rules
 
 Some shots don't have a fixed angle. Because your shot list is always in the same order,
@@ -120,6 +126,7 @@ under `"extra_folders"` in `categories.json`.
   "tolerance": 0.5,
   "categories": [
     { "name": "Tower Flight", "pitch": -40 },
+    { "name": "Tower Flight", "pitch": -50 },
     { "name": "Uplook", "pitch": 20 },
     { "name": "Wide band example", "min": -30, "max": -10 }
   ],

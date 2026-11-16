@@ -23,9 +23,11 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".dng"}
 
 # Same targets as v5: each category matches pitch = center +/- tolerance.
 DEFAULT_CONFIG = {
+    "config_version": 2,
     "tolerance": 0.5,
     "categories": [
         {"name": "Tower Flight", "pitch": -40},
+        {"name": "Tower Flight", "pitch": -50},  # taller towers
         {"name": "Downlook", "pitch": -35},
         {"name": "Uplook", "pitch": 20},
         {"name": "Center In", "pitch": 0},
@@ -100,10 +102,42 @@ def config_path() -> Path:
 
 def ensure_config_file(path: Path | None = None) -> Path:
     """Create categories.json with the defaults if it doesn't exist yet."""
+    """Create categories.json with the defaults if it doesn't exist yet, or
+    bring an older one up to date (only ever adds new defaults, once)."""
     path = path or config_path()
     if not path.exists():
         path.write_text(json.dumps(DEFAULT_CONFIG, indent=2), encoding="utf-8")
+        return path
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return path  # leave a file we can't read alone; errors show when sorting
+    if migrate_config(cfg):
+        path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
     return path
+
+
+CONFIG_VERSION = DEFAULT_CONFIG["config_version"]
+
+
+def migrate_config(cfg: dict) -> bool:
+    """Upgrade a settings dict in place. Returns True if it changed.
+    Each step runs once (tracked by "config_version") and only adds things,
+    so anything the user removed later is never put back."""
+    if not isinstance(cfg, dict):
+        return False
+    version = int(cfg.get("config_version", 1))
+    if version >= CONFIG_VERSION:
+        return False
+    if version < 2:
+        cats = cfg.setdefault("categories", [])
+        has_50 = any(float(c.get("pitch", 999)) == -50 for c in cats if isinstance(c, dict))
+        if not has_50:
+            idx = next((i + 1 for i, c in enumerate(cats)
+                        if isinstance(c, dict) and c.get("name") == "Tower Flight"), len(cats))
+            cats.insert(idx, {"name": "Tower Flight", "pitch": -50})
+    cfg["config_version"] = CONFIG_VERSION
+    return True
 
 
 def categories_from_config(cfg: dict, tolerance: float | None = None) -> list[Category]:
@@ -222,7 +256,9 @@ def apply_facing_rules(
 def load_config(path: Path | None = None) -> dict:
     path = path or config_path()
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+        migrate_config(cfg)  # in memory too, in case the file couldn't be saved
+        return cfg
     except FileNotFoundError:
         return DEFAULT_CONFIG
 
