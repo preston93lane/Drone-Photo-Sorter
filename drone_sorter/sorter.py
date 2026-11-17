@@ -304,11 +304,50 @@ def _biggest_turn(metas: list[PhotoMeta], idxs: list[int]) -> float:
                default=0.0)
 
 
+FULL_ORBIT_DEGREES = 270.0  # a continuous sweep this long = a tower orbit
+
+
+def _pause_breaks(metas: list[PhotoMeta], idxs: list[int],
+                  pause_seconds: float, pause_factor: float) -> set[int]:
+    """Positions in ``idxs`` that start after a rooftop-style pause."""
+    timed = [(i, metas[k].taken) for i, k in enumerate(idxs) if metas[k].taken is not None]
+    if len(timed) < 3:
+        return set()
+    gaps = [(t2 - t1, i2) for (_, t1), (i2, t2) in zip(timed, timed[1:])]
+    typical = _median([g for g, _ in gaps])
+    return {i for g, i in gaps if g >= pause_seconds and g >= pause_factor * max(typical, 0.1)}
+
+
+def _longest_sweep(metas: list[PhotoMeta], idxs: list[int], breaks: set[int]) -> float:
+    """Longest continuous camera rotation (degrees), restarting at each pause
+    and at any sudden flip. Small back-and-forth wobble cancels out."""
+    best = run = 0.0
+    prev = None
+    for i, k in enumerate(idxs):
+        yaw = metas[k].yaw
+        if yaw is None:
+            continue
+        if prev is None or i in breaks:
+            run = 0.0
+        else:
+            step = (yaw - prev + 180) % 360 - 180
+            if abs(step) >= MIN_FLIP_DEGREES:
+                run = 0.0
+            else:
+                run += step
+        best = max(best, abs(run))
+        prev = yaw
+    return best
+
+
 def looks_like_tower(metas: list[PhotoMeta], categories: list[str],
-                     segments: list[list[int]], rules: Iterable[tuple[str, str]]) -> bool:
-    """True if every downlook set's 0-degree photos show the tower pattern: a
-    sudden ~180 degree flip between the Center In and Center Out orbits.
-    Rooftop arcs keep turning smoothly, so they have no such flip."""
+                     segments: list[list[int]], rules: Iterable[tuple[str, str]],
+                     pause_seconds: float = 3.0, pause_factor: float = 3.0) -> bool:
+    """True if every downlook set's 0-degree photos show a tower pattern:
+      * a sudden ~180 degree flip between the Center In and Center Out orbits, or
+      * a full orbit: about 270 degrees or more of continuous turning without a
+        pause (towers with no Center Out requested).
+    Rooftop sectors are ~180 degree arcs separated by a pause, with no flip."""
     cat = next(iter(rules), ("Center In", ""))[0]
     checked = 0
     for seg in segments:
@@ -316,8 +355,12 @@ def looks_like_tower(metas: list[PhotoMeta], categories: list[str],
         if len(idxs) < 2:
             continue
         checked += 1
-        if _biggest_turn(metas, idxs) < MIN_FLIP_DEGREES:
-            return False
+        if _biggest_turn(metas, idxs) >= MIN_FLIP_DEGREES:
+            continue
+        breaks = _pause_breaks(metas, idxs, pause_seconds, pause_factor)
+        if _longest_sweep(metas, idxs, breaks) >= FULL_ORBIT_DEGREES:
+            continue
+        return False
     return checked > 0
 
 
@@ -706,7 +749,8 @@ def sort_photos(
         #    pattern (a ~180 degree flip between Center In and Center Out).
         new_cats, new_reasons, segments = apply_sector_rule([cats[k] for k in idxs], sector_rule)
         is_roof = segments is not None and not looks_like_tower(
-            metas, [cats[k] for k in idxs], segments, facing_rules or [])
+            metas, [cats[k] for k in idxs], segments, facing_rules or [],
+            pause_seconds, pause_factor)
         if is_roof:
             merge(new_cats, new_reasons)
         if is_roof and rooftop:

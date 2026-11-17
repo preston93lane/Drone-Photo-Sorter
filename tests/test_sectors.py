@@ -106,8 +106,9 @@ def test_small_hiccup_is_not_the_pause(tmp_path):
     s.burst("-35.00", 2, gap=4)
     s.arc(90, 350, 30, first_gap=6)
     res = run(tmp_path / "Roof")
-    check(res, first + second, "Center In")
-    assert "no Center Out found" in res[first[0]].rule
+    check(res, first + second, "Center In")   # a 2 s hiccup never splits
+    # (two continuous ~350 degree sweeps with no pause = a tower shot twice, so no Downlook N)
+    assert not any(r.category.startswith("Downlook ") for r in res.values())
 
 
 def test_tower_site_unchanged(tmp_path):
@@ -268,3 +269,49 @@ def test_tower_single_orbit_with_pause_stays_center_in(tmp_path):
     ins += s.arc(352, 5, 3, first_gap=20)     # long pause near the end
     res = run(t)
     check(res, ins, "Center In")
+
+
+def in_only_tower_set(s, start=0, pause_at=None):
+    down = s.burst("-35.00", 3, gap=4)
+    ins = [s.shot("0.00", start + y, 20 if (pause_at and i == pause_at) else (6 if i == 0 else 0.7))
+           for i, y in enumerate(range(0, 356, 10))]
+    ups = s.burst("+20.00", 2, gap=6)
+    return down, ins, ups
+
+
+def test_tower_shot_twice_without_center_out(tmp_path):
+    t = tmp_path / "Tower"
+    s = Shooter(t)
+    a = in_only_tower_set(s, 0)
+    b = in_only_tower_set(s, 120)
+    res = {r.source.name: r for r in sort_photos([t], CATS, **KW)}
+    for down, ins, ups in (a, b):
+        check(res, down, "Downlook")
+        check(res, ins, "Center In")
+        check(res, ups, "Uplook")
+    assert not (t / "Cable Run").exists() and not (t / "Downlook 1").exists()
+
+
+def test_mixed_tower_one_set_with_out_one_without(tmp_path):
+    t = tmp_path / "Tower"
+    s = Shooter(t)
+    a = tower_set(s, 0)
+    b = in_only_tower_set(s, 60)
+    res = run(t)
+    check(res, a[0] + b[0], "Downlook")
+    check(res, a[1] + b[1], "Center In")
+    check(res, a[2], "Center Out")
+
+
+def test_rooftop_in_only_sectors_are_still_rooftop(tmp_path):
+    roof = tmp_path / "Roof"
+    s = Shooter(roof)
+    sets = []
+    for start in (40, 170, 300):
+        down = s.burst("-35.00", 3, gap=4)
+        ins = s.arc(start, 180, 15, first_gap=6)       # ~180 arc, no Center Out
+        sets.append((down, ins))
+    res = run(roof)
+    for n, (down, ins) in enumerate(sets, 1):
+        check(res, down, f"Downlook {n}")
+        check(res, ins, "Center In")

@@ -137,8 +137,9 @@ On rooftops each sector is shot as a group: **Downlook (−35°) → Center In a
 
 **Tower or rooftop?** A tower is occasionally shot twice (two downlook / Center In /
 Center Out / Uplook sets). The app tells it apart from a rooftop by the tower pattern:
-if every set's 0° photos contain the ~180° direction flip between Center In and Center
-Out, it's a tower. Then the downlooks stay in **Downlook**, and Compound Flight keeps its
+if every set's 0° photos show either the ~180° direction flip between Center In and Center
+Out, **or** a full orbit (about 270° or more of continuous turning without a pause, for
+orders with no Center Out), it's a tower. Then the downlooks stay in **Downlook**, and Compound Flight keeps its
 name with no Cable Run folder. Rooftop arcs turn smoothly without that flip.
 
 **Pauses only count on rooftops.** On tower sites, a pause during the Center In orbit
