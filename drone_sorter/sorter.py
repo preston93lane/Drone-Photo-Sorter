@@ -298,6 +298,29 @@ def apply_sector_rule(categories: list[str], rule: dict | None):
     return cats, reasons, segments
 
 
+def _biggest_turn(metas: list[PhotoMeta], idxs: list[int]) -> float:
+    with_yaw = [k for k in idxs if metas[k].yaw is not None]
+    return max((_turn(metas[a].yaw, metas[b].yaw) for a, b in zip(with_yaw, with_yaw[1:])),
+               default=0.0)
+
+
+def looks_like_tower(metas: list[PhotoMeta], categories: list[str],
+                     segments: list[list[int]], rules: Iterable[tuple[str, str]]) -> bool:
+    """True if every downlook set's 0-degree photos show the tower pattern: a
+    sudden ~180 degree flip between the Center In and Center Out orbits.
+    Rooftop arcs keep turning smoothly, so they have no such flip."""
+    cat = next(iter(rules), ("Center In", ""))[0]
+    checked = 0
+    for seg in segments:
+        idxs = [k for k in seg if categories[k] == cat]
+        if len(idxs) < 2:
+            continue
+        checked += 1
+        if _biggest_turn(metas, idxs) < MIN_FLIP_DEGREES:
+            return False
+    return checked > 0
+
+
 def _median(xs: list[float]) -> float:
     xs = sorted(xs)
     m = len(xs) // 2
@@ -308,6 +331,7 @@ def apply_facing_rules(
     metas: list[PhotoMeta], categories: list[str], rules: Iterable[tuple[str, str]],
     segments: list[list[int]] | None = None,
     pause_seconds: float = 3.0, pause_factor: float = 3.0,
+    allow_pause: bool = True,
 ) -> tuple[list[str], list[str]]:
     """Split Center In / Center Out, separately within each segment.
 
@@ -324,8 +348,8 @@ def apply_facing_rules(
     """
     cats = list(categories)
     reasons = [""] * len(cats)
-    rooftop = segments is not None
-    segs = segments if rooftop else [list(range(len(cats)))]
+    rooftop = segments is not None and allow_pause
+    segs = segments if segments is not None else [list(range(len(cats)))]
     for cat, away in rules:
         for n, seg in enumerate(segs, 1):
             idxs = [k for k in seg if cats[k] == cat]
@@ -340,7 +364,7 @@ def apply_facing_rules(
                     split_at = with_yaw[pos]
                     why = f"{where}second orbit (camera direction flipped {biggest:.0f}°)"
 
-            if split_at is None:
+            if split_at is None and allow_pause:
                 timed = [k for k in idxs if metas[k].taken is not None]
                 if len(timed) >= 3:
                     gaps = [(metas[b].taken - metas[a].taken, i)
@@ -677,10 +701,15 @@ def sort_photos(
         #    no longer "Downlook" and can't start a false rooftop sector
         if rules:
             merge(*apply_sequence_rules([m.pitch for m in metas], [cats[k] for k in idxs], rules))
-        # 2) rooftop sectors
+        # 2) rooftop sectors: several downlook sets. A tower shot twice (rare)
+        #    also has several, but each set's 0-degree photos show the tower
+        #    pattern (a ~180 degree flip between Center In and Center Out).
         new_cats, new_reasons, segments = apply_sector_rule([cats[k] for k in idxs], sector_rule)
-        merge(new_cats, new_reasons)
-        if segments is not None and rooftop:
+        is_roof = segments is not None and not looks_like_tower(
+            metas, [cats[k] for k in idxs], segments, facing_rules or [])
+        if is_roof:
+            merge(new_cats, new_reasons)
+        if is_roof and rooftop:
             roof_folders.add(jobs[idxs[0]][1].parent)
             for k in idxs:
                 if cats[k] in rooftop["rename"]:
@@ -689,7 +718,7 @@ def sort_photos(
         # 3) Center In / Center Out, per sector
         if facing_rules:
             merge(*apply_facing_rules(metas, [cats[k] for k in idxs], facing_rules, segments,
-                                      pause_seconds, pause_factor))
+                                      pause_seconds, pause_factor, allow_pause=is_roof))
 
     if rooftop and not dry_run:
         for folder in roof_folders:

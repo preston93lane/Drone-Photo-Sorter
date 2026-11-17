@@ -217,3 +217,54 @@ def test_settings_from_6_8_get_downlook_names(tmp_path):
     ensure_config_file(p)
     cfg = json.loads(p.read_text())
     assert cfg["sector_rule"]["folder"] == "Downlook {n}" and cfg["config_version"] == 3
+
+
+def tower_set(s, start=0, pause_in_middle=None):
+    """Downlook, then a full ~360 Center In orbit, a ~180 flip, a full Center Out orbit."""
+    down = s.burst("-35.00", 3, gap=4)
+    ins = []
+    for i, y in enumerate(range(0, 361, 20)):
+        gap = pause_in_middle if (pause_in_middle and i == 9) else 0.7
+        ins.append(s.shot("0.00", start + y, gap if i else 6))
+    outs = [s.shot("0.00", start + 180 + y, 0.7 if y else 3) for y in range(0, 361, 20)]
+    ups = s.burst("+20.00", 2, gap=6)
+    return down, ins, outs, ups
+
+
+def test_tower_shot_twice_is_not_a_rooftop(tmp_path):
+    t = tmp_path / "Tower"
+    s = Shooter(t)
+    s.burst("-40.00", 4)
+    a = tower_set(s, start=0)
+    b = tower_set(s, start=90)
+    s.shot("-45.00"); s.shot("-20.00")
+    res = {r.source.name: r for r in sort_photos([t], CATS, **KW)}
+    for down, ins, outs, ups in (a, b):
+        check(res, down, "Downlook")          # one Downlook folder, no Downlook 1/2
+        check(res, ins, "Center In")
+        check(res, outs, "Center Out")
+        check(res, ups, "Uplook")
+    assert (t / "Compound Flight").is_dir()
+    assert not (t / "BSO").exists() and not (t / "Cable Run").exists()
+    assert not (t / "Downlook 1").exists()
+
+
+@pytest.mark.parametrize("sets", [1, 2])
+def test_pause_never_splits_center_in_on_towers(tmp_path, sets):
+    t = tmp_path / "Tower"
+    s = Shooter(t)
+    groups = [tower_set(s, start=30 * i, pause_in_middle=15) for i in range(sets)]
+    res = run(t)
+    for down, ins, outs, ups in groups:
+        check(res, ins, "Center In")          # the 15 s pause mid-orbit is ignored
+        check(res, outs, "Center Out")
+
+
+def test_tower_single_orbit_with_pause_stays_center_in(tmp_path):
+    t = tmp_path / "Tower"
+    s = Shooter(t)
+    s.burst("-35.00", 3)
+    ins = s.arc(0, 350, 30, gap=0.7)
+    ins += s.arc(352, 5, 3, first_gap=20)     # long pause near the end
+    res = run(t)
+    check(res, ins, "Center In")
