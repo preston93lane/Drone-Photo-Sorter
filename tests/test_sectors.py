@@ -1,4 +1,4 @@
-"""Rooftop sectors: separate Sector N downlook folders, Center In/Out per sector."""
+"""Rooftop sectors: separate Downlook N folders, Center In/Out per sector."""
 
 import math
 
@@ -7,14 +7,16 @@ import pytest
 from drone_sorter.pitch_reader import read_photo_meta
 from drone_sorter.sorter import (
     DEFAULT_CONFIG, categories_from_config, extra_folders_from_config,
-    facing_rules_from_config, rules_from_config, sector_rule_from_config, sort_photos,
+    facing_rules_from_config, rooftop_from_config, rules_from_config, sector_rule_from_config,
+    sort_photos,
 )
 from helpers import make_dji
 
 CFG = DEFAULT_CONFIG
 CATS = categories_from_config(CFG)
 KW = dict(rules=rules_from_config(CFG), facing_rules=facing_rules_from_config(CFG),
-          extra_folders=extra_folders_from_config(CFG), sector_rule=sector_rule_from_config(CFG))
+          extra_folders=extra_folders_from_config(CFG), sector_rule=sector_rule_from_config(CFG),
+          rooftop=rooftop_from_config(CFG))
 
 
 def dji(deg):
@@ -67,7 +69,7 @@ def test_three_sectors_with_uplooks(tmp_path):
     sectors = [s.sector(70), s.sector(200), s.sector(310)]
     res = run(tmp_path / "Roof")
     for n, (down, ins, outs, ups) in enumerate(sectors, 1):
-        check(res, down, f"Sector {n}")
+        check(res, down, f"Downlook {n}")
         check(res, ins, "Center In")
         check(res, outs, "Center Out")
         check(res, ups, "Uplook")
@@ -80,7 +82,7 @@ def test_sectors_without_uplooks(tmp_path):
     sectors = [s.sector(a, uplook=False) for a in (10, 140, 260)]
     res = run(tmp_path / "Roof")
     for n, (down, ins, outs, _) in enumerate(sectors, 1):
-        check(res, down, f"Sector {n}")
+        check(res, down, f"Downlook {n}")
         check(res, ins, "Center In")
         check(res, outs, "Center Out")
 
@@ -129,7 +131,7 @@ def test_shot_order_off_means_no_sectors(tmp_path):
     s.sector(180)
     kw = dict(KW, rules=[], sector_rule=None)
     res = sort_photos([tmp_path / "Roof"], CATS, dry_run=True, **kw)
-    assert not any(r.category.startswith("Sector") for r in res)
+    assert not any(r.category.startswith("Downlook ") for r in res)
 
 
 def test_rerun_skips_sector_folders(tmp_path):
@@ -137,10 +139,10 @@ def test_rerun_skips_sector_folders(tmp_path):
     s.sector(0)
     s.sector(180)
     first = sort_photos([tmp_path / "Roof"], CATS, **KW)
-    assert (tmp_path / "Roof" / "Sector 2").is_dir()
+    assert (tmp_path / "Roof" / "Downlook 2").is_dir()
     again = sort_photos([tmp_path / "Roof"], CATS, **KW)
     assert len(again) == len(first)
-    assert all("Sector" not in r.source.parent.name for r in again)
+    assert all(not r.source.parent.name.startswith("Downlook ") for r in again)
 
 
 def test_time_from_xmp_with_fraction(tmp_path):
@@ -174,3 +176,44 @@ def test_time_from_exif_with_subseconds(tmp_path):
         f.write_bytes(exif_jpeg(stamp, sub) + b'drone-dji:GimbalPitchDegree="0.00"')
         times.append(read_photo_meta(f).taken)
     assert times[1] - times[0] == pytest.approx(2.75)
+
+
+def test_rooftop_renames_compound_to_bso_and_adds_cable_run(tmp_path):
+    roof = tmp_path / "Roof"
+    s = Shooter(roof)
+    s.sector(0)
+    s.sector(180)
+    bso = [s.shot("-45.00"), s.shot("-30.0"), s.shot("-20.00")]
+    res = {r.source.name: r for r in sort_photos([roof], CATS, **KW)}
+    check(res, bso, "BSO")
+    assert (roof / "BSO").is_dir() and not (roof / "Compound Flight").exists()
+    assert (roof / "Cable Run").is_dir() and (roof / "Access Road").is_dir()
+    assert (roof / "Downlook 1").is_dir() and (roof / "Downlook 2").is_dir()
+    assert not (roof / "Downlook").exists()
+    # re-run doesn't pick up anything from BSO / Downlook N / Cable Run
+    (roof / "Cable Run" / "IMG_0001.JPG").write_bytes(b"phone")
+    again = sort_photos([roof], CATS, **KW)
+    assert {r.source.parent for r in again} == {roof}
+
+
+def test_tower_keeps_compound_flight_and_no_cable_run(tmp_path):
+    tower = tmp_path / "Tower"
+    s = Shooter(tower)
+    s.burst("-35.00", 3)
+    s.arc(0, 360, 12)
+    comp = [s.shot("-45.00"), s.shot("-20.00")]
+    res = {r.source.name: r for r in sort_photos([tower], CATS, **KW)}
+    check(res, comp, "Compound Flight")
+    assert not (tower / "Cable Run").exists() and not (tower / "BSO").exists()
+
+
+def test_settings_from_6_8_get_downlook_names(tmp_path):
+    import json
+    from drone_sorter.sorter import ensure_config_file
+    p = tmp_path / "categories.json"
+    p.write_text(json.dumps({"config_version": 2, "categories": [],
+                             "sector_rule": {"category": "Downlook", "between": "Center In",
+                                             "folder": "Sector {n}"}}))
+    ensure_config_file(p)
+    cfg = json.loads(p.read_text())
+    assert cfg["sector_rule"]["folder"] == "Downlook {n}" and cfg["config_version"] == 3

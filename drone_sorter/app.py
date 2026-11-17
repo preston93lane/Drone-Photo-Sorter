@@ -22,6 +22,7 @@ from .sorter import (
     extra_folders_from_config,
     sector_folder_names,
     sector_rule_from_config,
+    rooftop_from_config,
     ensure_config_file,
     find_images,
     load_config,
@@ -88,6 +89,7 @@ class DroneSorterApp:
         self.facing = []
         self.extra = []
         self.sector = None
+        self.rooftop = None
         self.pause = (3.0, 3.0)
         self.tolerance = tk.StringVar()
 
@@ -403,7 +405,10 @@ class DroneSorterApp:
         try:
             cfg = load_config(self.config_file)
             extra = ({away for _, away in facing_rules_from_config(cfg)} | set(extra_folders_from_config(cfg))
-                     | sector_folder_names(sector_rule_from_config(cfg)))
+                     | sector_folder_names(sector_rule_from_config(cfg))
+                     | set(rooftop_from_config(cfg)["rename"].values())
+                     | set(rooftop_from_config(cfg)["extra_folders"])
+                     | {f"Sector {n}" for n in range(1, 21)})
         except (ValueError, KeyError, TypeError):
             extra = set()
         names = {c.name for c in cats} | {UNSORTED} | extra
@@ -481,6 +486,7 @@ class DroneSorterApp:
             self.facing = facing_rules_from_config(cfg)
             self.extra = extra_folders_from_config(cfg)
             self.sector = sector_rule_from_config(cfg) if self.use_order.get() else None
+            self.rooftop = rooftop_from_config(cfg)
             self.pause = (float(cfg.get("pause_seconds", 3.0)), float(cfg.get("pause_factor", 3.0)))
         except (ValueError, KeyError, TypeError) as e:
             if not silent:
@@ -522,6 +528,7 @@ class DroneSorterApp:
                 results = sort_photos(
                     self.source_dirs, categories, move=move, dry_run=dry, rules=self.rules,
                     facing_rules=self.facing, extra_folders=self.extra, sector_rule=self.sector,
+                    rooftop=self.rooftop,
                     pause_seconds=self.pause[0], pause_factor=self.pause[1],
                     on_progress=lambda i, n, r: self.events.put(("progress", i, n, r)),
                     cancel=self.cancel_event,

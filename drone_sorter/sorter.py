@@ -23,7 +23,7 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".dng"}
 
 # Same targets as v5: each category matches pitch = center +/- tolerance.
 DEFAULT_CONFIG = {
-    "config_version": 2,
+    "config_version": 3,
     "tolerance": 0.5,
     "categories": [
         {"name": "Tower Flight", "pitch": -40},
@@ -53,7 +53,10 @@ DEFAULT_CONFIG = {
     "extra_folders": ["Access Road"],
     # Rooftops: several Downlook sets, each followed by 0-degree photos, are
     # separate sectors. Each set goes to its own folder ("Sector 1", ...).
-    "sector_rule": {"category": "Downlook", "between": "Center In", "folder": "Sector {n}"},
+    "sector_rule": {"category": "Downlook", "between": "Center In", "folder": "Downlook {n}"},
+    # When a folder is recognized as a rooftop (2+ downlook sets): rename folders
+    # and add extra empty folders for that site only.
+    "rooftop": {"rename": {"Compound Flight": "BSO"}, "extra_folders": ["Cable Run"]},
     # Center In/Out without a direction flip: split at a pause in shooting
     # at least this long and this many times the normal gap between photos.
     "pause_seconds": 3.0,
@@ -143,6 +146,11 @@ def migrate_config(cfg: dict) -> bool:
             idx = next((i + 1 for i, c in enumerate(cats)
                         if isinstance(c, dict) and c.get("name") == "Tower Flight"), len(cats))
             cats.insert(idx, {"name": "Tower Flight", "pitch": -50})
+    if version < 3:
+        # rooftop downlook folders were briefly called "Sector N"
+        rule = cfg.get("sector_rule")
+        if isinstance(rule, dict) and rule.get("folder") == "Sector {n}":
+            rule["folder"] = "Downlook {n}"
     cfg["config_version"] = CONFIG_VERSION
     return True
 
@@ -241,6 +249,12 @@ def sector_rule_from_config(cfg: dict) -> dict | None:
     return {"category": str(rule.get("category", "Downlook")),
             "between": str(rule.get("between", "Center In")),
             "folder": str(rule.get("folder", "Sector {n}"))}
+
+
+def rooftop_from_config(cfg: dict) -> dict:
+    raw = cfg.get("rooftop", DEFAULT_CONFIG["rooftop"]) or {}
+    return {"rename": {str(k): str(v) for k, v in (raw.get("rename") or {}).items()},
+            "extra_folders": [str(n).strip() for n in (raw.get("extra_folders") or []) if str(n).strip()]}
 
 
 def sector_folder_names(rule: dict | None) -> set[str]:
@@ -600,6 +614,7 @@ def sort_photos(
     facing_rules: list[tuple[str, str]] | None = None,
     extra_folders: list[str] | None = None,
     sector_rule: dict | None = None,
+    rooftop: dict | None = None,
     pause_seconds: float = 3.0,
     pause_factor: float = 3.0,
 ) -> list[FileResult]:
@@ -611,7 +626,10 @@ def sort_photos(
     output_names = ({c.name for c in categories} | {UNSORTED}
                     | {away for _, away in (facing_rules or [])} | set(extra_folders or [])
                     # always skip sector folders on re-runs, even with the rule switched off
-                    | sector_folder_names(sector_rule or sector_rule_from_config(DEFAULT_CONFIG)))
+                    | sector_folder_names(sector_rule or sector_rule_from_config(DEFAULT_CONFIG))
+                    | {f"Sector {n}" for n in range(1, MAX_SECTORS + 1)}   # older name
+                    | set((rooftop or {}).get("rename", {}).values())
+                    | set((rooftop or {}).get("extra_folders", [])))
     jobs: list[tuple[Path, Path]] = []
     seen: set[Path] = set()
     for root in sources:
@@ -643,6 +661,7 @@ def sort_photos(
     cats = [assign_category(m.pitch, categories) for m, _ in readings]
     reasons = [""] * total
     by_folder: dict[Path, list[int]] = {}
+    roof_folders: set[Path] = set()
     for idx, (_, img) in enumerate(jobs):
         by_folder.setdefault(img.parent, []).append(idx)
     for idxs in by_folder.values():
@@ -661,10 +680,21 @@ def sort_photos(
         # 2) rooftop sectors
         new_cats, new_reasons, segments = apply_sector_rule([cats[k] for k in idxs], sector_rule)
         merge(new_cats, new_reasons)
+        if segments is not None and rooftop:
+            roof_folders.add(jobs[idxs[0]][1].parent)
+            for k in idxs:
+                if cats[k] in rooftop["rename"]:
+                    cats[k] = rooftop["rename"][cats[k]]
+                    reasons[k] = reasons[k] or "rooftop"
         # 3) Center In / Center Out, per sector
         if facing_rules:
             merge(*apply_facing_rules(metas, [cats[k] for k in idxs], facing_rules, segments,
                                       pause_seconds, pause_factor))
+
+    if rooftop and not dry_run:
+        for folder in roof_folders:
+            for name in rooftop["extra_folders"]:
+                (folder / name).mkdir(exist_ok=True)
 
     if extra_folders and not dry_run:
         for folder in by_folder:
@@ -712,6 +742,7 @@ def main(argv: list[str] | None = None) -> int:
                           facing_rules=facing_rules_from_config(cfg),
                           extra_folders=extra_folders_from_config(cfg),
                           sector_rule=sector_rule_from_config(cfg),
+                          rooftop=rooftop_from_config(cfg),
                           pause_seconds=float(cfg.get("pause_seconds", 3.0)),
                           pause_factor=float(cfg.get("pause_factor", 3.0)))
     for r in results:

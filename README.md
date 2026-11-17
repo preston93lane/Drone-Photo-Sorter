@@ -118,8 +118,12 @@ On rooftops each sector is shot as a group: **Downlook (−35°) → Center In a
 
 - A new sector starts at a −35° photo when 0° photos have been taken since the
   previous −35° photo. With 2 or more sectors, each sector's downlooks go to their own
-  folder: **Sector 1**, **Sector 2**, … With only one (a normal tower site), they stay in
-  **Downlook**.
+  folder: **Downlook 1**, **Downlook 2**, … With only one (a normal tower site), they stay
+  in **Downlook**.
+- When a folder is recognized as a rooftop (2+ downlook sets), **Compound Flight** is
+  named **BSO** instead, and an empty **Cable Run** folder is created (along with Access
+  Road). Tower sites are unchanged. Both are configurable under `"rooftop"` in
+  `categories.json`.
 - All center ins, center outs and uplooks still go to **Center In**, **Center Out** and
   **Uplook**.
 - **Center In vs Center Out is decided per sector.** On rooftops the camera keeps turning

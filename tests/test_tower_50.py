@@ -52,7 +52,7 @@ def test_old_settings_file_gains_minus_50_once(tmp_path):
     p = old_file(tmp_path)
     ensure_config_file(p)
     cfg = json.loads(p.read_text())
-    assert cfg["config_version"] == 2 and cfg["tolerance"] == 0.7
+    assert cfg["config_version"] == 3 and cfg["tolerance"] == 0.7
     assert cfg["categories"] == [
         {"name": "Tower Flight", "pitch": -40}, {"name": "Tower Flight", "pitch": -50},
         {"name": "My Custom", "pitch": 33}]
